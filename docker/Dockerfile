@@ -7,4 +7,4 @@ RUN git clone https://github.com/manuelmann/iperf2-test.git && cd iperf2-test &&
 
 FROM fedora:lastest
 COPY --from=0 /iperf2-test/src/iperf /bin/iperf
-ENTRYPOINT["/bin/iperf"]
+ENTRYPOINT ["/bin/iperf"]
