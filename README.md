@@ -1,1 +1,1 @@
-# iperf-test
+# iperf2-test
