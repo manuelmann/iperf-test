@@ -1,7 +1,7 @@
 FROM fedora:latest
 MAINTAINER Manuel
 
-RUN dnf install -y git gcc-c++ make
+RUN dnf install -y git gcc-c++ libstdc++ make
 
 RUN git clone https://github.com/manuelmann/iperf2-test.git && cd iperf2-test && ./configure && make
 
