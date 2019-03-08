@@ -1,6 +1,28 @@
-#!/usr/bin/env python3.5
+# ----------------------------------------------------------------
+# * Copyright (c) 2018
+# * Broadcom Corporation
+# * All Rights Reserved.
+# *---------------------------------------------------------------
+# Redistribution and use in source and binary forms, with or without modification, are permitted
+# provided that the following conditions are met:
 #
-# Author Robert J. McMahon
+# Redistributions of source code must retain the above copyright notice, this list of conditions
+# and the following disclaimer.  Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the documentation and/or other
+# materials provided with the distribution.  Neither the name of the Broadcom nor the names of
+# contributors may be used to endorse or promote products derived from this software without
+# specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+# FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USEn,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+# IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+# OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Author Robert J. McMahon, Broadcom LTD
 # Date April 2016
 
 import re
@@ -18,12 +40,16 @@ import scipy
 import scipy.spatial
 import numpy as np
 import tkinter
+import ctypes
+import ipaddress
+import collections
 
 from datetime import datetime as datetime, timezone
 from scipy import stats
 from scipy.cluster import hierarchy
 from scipy.cluster.hierarchy import linkage
 import matplotlib.pyplot as plt
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +60,7 @@ class iperf_flow(object):
     loop = None
     flow_scope = ("flowstats")
     tasks = []
+    flowid2name = defaultdict(str)
 
     @classmethod
     def sleep(cls, time=0, text=None, stoptext=None) :
@@ -64,7 +91,7 @@ class iperf_flow(object):
         iperf_flow.loop.close()
 
     @classmethod
-    def run(cls, time=None, flows='all', sample_delay=None, io_timer=None, preclean=False) :
+    def run(cls, time=None, amount=None, flows='all', sample_delay=None, io_timer=None, preclean=False, parallel=None, triptime=False) :
         if flows == 'all' :
             flows = iperf_flow.get_instances()
         if not flows:
@@ -89,7 +116,7 @@ class iperf_flow(object):
         except asyncio.TimeoutError:
             logging.error('flow server start timeout')
             raise
-        tasks = [asyncio.ensure_future(flow.tx.start(time=time), loop=iperf_flow.loop) for flow in flows]
+        tasks = [asyncio.ensure_future(flow.tx.start(time=time, amount=amount, parallel=parallel, triptime=triptime), loop=iperf_flow.loop) for flow in flows]
         try :
             iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
         except asyncio.TimeoutError:
@@ -104,16 +131,24 @@ class iperf_flow(object):
             except asyncio.TimeoutError:
                 logging.error('flow traffic check timeout')
                 raise
+        if time :
+            iperf_flow.sleep(time=time, text="Running traffic start", stoptext="Stopping flows")
+            # Signal the remote iperf client sessions to stop them
+            tasks = [asyncio.ensure_future(flow.tx.signal_stop(), loop=iperf_flow.loop) for flow in flows]
+            try :
+                iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=3, loop=iperf_flow.loop))
+            except asyncio.TimeoutError:
+                logging.error('flow tx stop timeout')
+                raise
 
-        iperf_flow.sleep(time=time, text="Running traffic start", stoptext="Stopping flows")
-
-        # Signal the remote iperf client sessions to stop them
-        tasks = [asyncio.ensure_future(flow.tx.signal_stop(), loop=iperf_flow.loop) for flow in flows]
-        try :
-            iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=3, loop=iperf_flow.loop))
-        except asyncio.TimeoutError:
-            logging.error('flow tx stop timeout')
-            raise
+        elif amount:
+            tasks = [asyncio.ensure_future(flow.transmit_completed(), loop=iperf_flow.loop) for flow in flows]
+            try :
+                iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
+            except asyncio.TimeoutError:
+                logging.error('flow tx completed timed out')
+                raise
+            logging.info('flow transmit completed')
 
         # Now signal the remote iperf server sessions to stop them
         tasks = [asyncio.ensure_future(flow.rx.signal_stop(), loop=iperf_flow.loop) for flow in flows]
@@ -125,6 +160,39 @@ class iperf_flow(object):
 
        # iperf_flow.loop.close()
         logging.info('flow run finished')
+
+    @classmethod
+    def commence(cls, time=None, flows='all', sample_delay=None, io_timer=None, preclean=False) :
+        if flows == 'all' :
+            flows = iperf_flow.get_instances()
+        if not flows:
+            logging.warn('flow run method called with no flows instantiated')
+            return
+
+        if preclean:
+            hosts = [flow.server for flow in flows]
+            hosts.extend([flow.client for flow in flows])
+            hosts=list(set(hosts))
+            tasks = [asyncio.ensure_future(iperf_flow.cleanup(user='root', host=host)) for host in hosts]
+            try :
+                iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
+            except asyncio.TimeoutError:
+                logging.error('preclean timeout')
+                raise
+
+        logging.info('flow start invoked')
+        tasks = [asyncio.ensure_future(flow.rx.start(time=time), loop=iperf_flow.loop) for flow in flows]
+        try :
+            iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
+        except asyncio.TimeoutError:
+            logging.error('flow server start timeout')
+            raise
+        tasks = [asyncio.ensure_future(flow.tx.start(time=time), loop=iperf_flow.loop) for flow in flows]
+        try :
+            iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
+        except asyncio.TimeoutError:
+            logging.error('flow client start timeout')
+            raise
 
     @classmethod
     def plot(cls, flows='all', title='None', directory='None') :
@@ -157,24 +225,26 @@ class iperf_flow(object):
 
 
     @classmethod
-    def stop(cls, flows='all') :
-        loop = asyncio.get_event_loop()
+    def cease(cls, flows='all') :
+        if not iperf_flow.loop :
+            iperf_flow.loop = asyncio.get_event_loop()
+
         if flows == 'all' :
             flows = iperf_flow.get_instances()
-        iperf_flow.set_loop(loop=loop)
-        tasks = [asyncio.ensure_future(flow.tx.stop(), loop=loop) for flow in flows]
-        try :
-            loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
-        except asyncio.TimeoutError:
-            logging.error('flow server start timeout')
-            raise
 
-        tasks = [asyncio.ensure_future(flow.rx.stop(), loop=loop) for flow in flows]
+        # Signal the remote iperf client sessions to stop them
+        tasks = [asyncio.ensure_future(flow.tx.signal_stop(), loop=iperf_flow.loop) for flow in flows]
         try :
-            loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
+            iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
         except asyncio.TimeoutError:
-            logging.error('flow server start timeout')
-            raise
+            logging.error('flow tx stop timeout')
+
+        # Now signal the remote iperf server sessions to stop them
+        tasks = [asyncio.ensure_future(flow.rx.signal_stop(), loop=iperf_flow.loop) for flow in flows]
+        try :
+            iperf_flow.loop.run_until_complete(asyncio.wait(tasks, timeout=10, loop=iperf_flow.loop))
+        except asyncio.TimeoutError:
+            logging.error('flow rx stop timeout')
 
     @classmethod
     async def cleanup(cls, host=None, sshcmd='/usr/bin/ssh', user='root') :
@@ -213,7 +283,7 @@ class iperf_flow(object):
         }
         return switcher.get(txt.upper(), None)
 
-    def __init__(self, name='iperf', server='localhost', client = 'localhost', user = None, proto = 'TCP', dst = '127.0.0.1', interval = 0.5, flowtime=10, offered_load = None, tos='BE', window='4M', debug = False, udptriggers = False, isoch = False, length = None, latency=True):
+    def __init__(self, name='iperf', server='localhost', client = 'localhost', user = None, proto = 'TCP', dstip = '127.0.0.1', interval = 0.5, flowtime=10, offered_load = '1m', tos='BE', window='4M', src=None, srcip = None, srcport = None, dstport = None,  debug = False, udptriggers = False, length = None, latency=False, ipg=0.005, amount=None):
         iperf_flow.instances.add(self)
         if not iperf_flow.loop :
             iperf_flow.set_loop()
@@ -221,31 +291,45 @@ class iperf_flow(object):
         self.name = name
         self.latency = latency
         self.udptriggers = udptriggers;
-        if not self.udptriggers :
+        if not dstport :
             iperf_flow.port += 1
-            self.port = iperf_flow.port
+            self.dstport = iperf_flow.port
         else:
-            self.port = 6001
+            self.dstport = dstport
+        self.dstip = dstip
+        self.srcip = srcip
+        self.srcport = srcport
+        try :
+            self.server = server.ipaddr
+        except AttributeError:
+            self.server = server
+        try :
+            self.client = client.ipaddr
+        except AttributeError:
+            self.client = client
 
-        self.server = server
-        self.client = client
         if not user :
             self.user = getpass.getuser()
         else :
             self.user = user
         self.proto = proto
-        self.dst = dst
         self.tos = tos
-        if not length :
-            self.length = 1470
-        else :
-            self.length = length;
-        self.isoch = isoch;
+        if length :
+            self.length = length
+
+        if amount :
+            self.amount = amount
         self.interval = round(interval,3)
         self.offered_load = offered_load
+        if self.offered_load :
+            if len(self.offered_load.split(':')) == 2 :
+                self.isoch = True
+                self.name += '-isoch'
+            else :
+                self.isoch = False
+        self.ipg = ipg
         self.debug = debug
         self.TRAFFIC_EVENT_TIMEOUT = round(self.interval * 4, 3)
-        self.flowstats = {'current_rxbytes' : None , 'current_txbytes' : None , 'flowrate' : None, 'starttime' : None}
         self.flowtime = flowtime
         # use python composition for the server and client
         # i.e. a flow has a server and a client
@@ -253,7 +337,19 @@ class iperf_flow(object):
         self.tx = iperf_client(name='{}->TX({})'.format(name, str(self.client)), loop=self.loop, host=self.client, flow=self, debug=self.debug)
         self.rx.window=window
         self.tx.window=window
+        self.ks_critical_p = 0.01
+        self.stats_reset()
+
+    def destroy(self) :
+        iperf_flow.instances.remove(self)
+
+    def __getattr__(self, attr) :
+        if attr in self.flowstats :
+            return self.flowstats[attr]
+
+    def stats_reset(self) :
         # Initialize the flow stats dictionary
+        self.flowstats = {'current_rxbytes' : None , 'current_txbytes' : None , 'flowrate' : None, 'starttime' : None, 'flowid' : None, 'endtime' : None}
         self.flowstats['txdatetime']=[]
         self.flowstats['txbytes']=[]
         self.flowstats['txthroughput']=[]
@@ -268,17 +364,11 @@ class iperf_flow(object):
         self.flowstats['reads']=[]
         self.flowstats['histograms']=[]
         self.flowstats['histogram_names'] = set()
-        self.ks_critical_p = 0.01
-
-    def destroy(self) :
-        iperf_flow.instances.remove(self)
-
-    def __getattr__(self, attr) :
-        if attr in self.flowstats :
-            return self.flowstats[attr]
+        self.flowstats['connect_time']=[]
+        self.flowstats['trip_time']=[]
 
     async def start(self):
-        self.flowstats = {'current_rxbytes' : None , 'current_txbytes' : None , 'flowrate' : None}
+        self.flowstats = {'current_rxbytes' : None , 'current_txbytes' : None , 'flowrate' : None, 'flowid' : None}
         await self.rx.start()
         await self.tx.start()
 
@@ -291,6 +381,10 @@ class iperf_flow(object):
             logging.info('{} {}'.format(self.name, 'traffic check invoked'))
             await self.rx.traffic_event.wait()
             await self.tx.traffic_event.wait()
+
+    async def transmit_completed(self) :
+        logging.info('{} {}'.format(self.name, 'waiting for transmit to complete'))
+        await self.tx.txcompleted.wait()
 
     async def stop(self):
         self.tx.stop()
@@ -340,7 +434,7 @@ class iperf_flow(object):
             logging.info('{} {}(condensed distance matrix)\n{}'.format(self.name, this_name,self.condensed_distance_matrix))
             self.linkage_matrix=linkage(self.condensed_distance_matrix, 'ward')
             try :
-                plt.figure()
+                plt.figure(figsize=(18,10))
                 dn = hierarchy.dendrogram(self.linkage_matrix)
                 plt.title("{} {}".format(self.name, this_name))
                 plt.savefig('{}/dn_{}_{}.png'.format(directory,self.name,this_name))
@@ -410,7 +504,7 @@ class iperf_server(object):
                             self._server.opened.set()
                             logging.debug('{} pipe reading (stdout,{})'.format(self._server.name, self._server.remotepid))
                     else :
-                        if self.proto == 'TCP' :
+                        if self._server.proto == 'TCP' :
                             m = self._server.regex_traffic.match(line)
                             if m :
                                 timestamp = datetime.now()
@@ -433,14 +527,20 @@ class iperf_server(object):
                                     self.flowstats['rxbytes'].append(m.group('bytes'))
                                     self.flowstats['rxthroughput'].append(m.group('throughput'))
                                     self.flowstats['reads'].append(m.group('reads'))
+                            else :
+                                m = self._server.regex_trip_time.match(line)
+                                if m :
+                                    self.flowstats['trip_time'].append(float(m.group('trip_time')) * 1000)
                         else :
-                            m = self._server.regex_final_isoch_traffic.match(line)
+                            m = self._server.regex_final_histogram_traffic.match(line)
                             if m :
                                 timestamp = datetime.now(timezone.utc).astimezone()
+                                self.flowstats['endtime']= timestamp
                                 self.flowstats['histogram_names'].add(m.group('pdfname'))
                                 self.flowstats['histograms'].append(flow_histogram(name=m.group('pdfname'),values=m.group('pdf'), population=m.group('population'), binwidth=m.group('binwidth'), starttime=self.flowstats['starttime'], endtime=timestamp, outliers=m.group('outliers'), uci=m.group('uci'), uci_val=m.group('uci_val'), lci=m.group('lci'), lci_val=m.group('lci_val')))
                                 # logging.debug('pdf {} {}={}'.format(m.group('pdfname'), m.group('pdf'), m.group('binwidth')))
                                 logging.info('pdf {} found with bin width={} us'.format(m.group('pdfname'),  m.group('binwidth')))
+
 
             elif fd == 2:
                 self._stderrbuffer += data
@@ -489,12 +589,12 @@ class iperf_server(object):
         conn_id = '{}'.format(self.name)
         self.adapter = self.CustomAdapter(logger, {'connid': conn_id})
 
-        # ex. Server listening on TCP port 61003 with pid 2565
-        self.regex_open_pid = re.compile(r'^Server listening on {} port {} with pid (?P<pid>\d+)'.format(self.proto, str(self.port)))
         # ex. [  4] 0.00-0.50 sec  657090 Bytes  10513440 bits/sec  449    449:0:0:0:0:0:0:0
         self.regex_traffic = re.compile(r'\[\s+\d+] (?P<timestamp>.*) sec\s+(?P<bytes>[0-9]+) Bytes\s+(?P<throughput>[0-9]+) bits/sec\s+(?P<reads>[0-9]+)')
         #ex. [  3] 0.00-21.79 sec T8(f)-PDF: bin(w=10us):cnt(261674)=223:1,240:1,241:1 (5/95%=117/144,obl/obu=0/0)
-        self.regex_final_isoch_traffic = re.compile(r'\[\s+\d+\] (?P<timestamp>.*) sec\s+(?P<pdfname>[A-Za-z0-9\-]+)\(f\)-PDF: bin\(w=(?P<binwidth>[0-9]+)us\):cnt\((?P<population>[0-9]+)\)=(?P<pdf>.+)\s+\((?P<lci>[0-9]+)/(?P<uci>[0-9]+)%=(?P<lci_val>[0-9]+)/(?P<uci_val>[0-9]+),Outliers=(?P<outliers>[0-9]+),obl/obu=[0-9]+/[0-9]+\)')
+        self.regex_final_histogram_traffic = re.compile(r'\[\s*\d+\] (?P<timestamp>.*) sec\s+(?P<pdfname>[A-Za-z0-9\-]+)\(f\)-PDF: bin\(w=(?P<binwidth>[0-9]+)us\):cnt\((?P<population>[0-9]+)\)=(?P<pdf>.+)\s+\((?P<lci>[0-9\.]+)/(?P<uci>[0-9\.]+)%=(?P<lci_val>[0-9]+)/(?P<uci_val>[0-9]+),Outliers=(?P<outliers>[0-9]+),obl/obu=[0-9]+/[0-9]+\)')
+        # 0.0000-0.5259 trip-time (3WHS done->fin+finack) = 0.5597 sec
+        self.regex_trip_time = re.compile(r'.+trip\-time\s+\(3WHS\sdone\->fin\+finack\)\s=\s(?P<trip_time>\d+\.\d+)\ssec')
 
     def __getattr__(self, attr):
         return getattr(self.flow, attr)
@@ -503,10 +603,16 @@ class iperf_server(object):
         if not self.closed.is_set() :
             return
 
+        # ex. Server listening on TCP port 61003 with pid 2565
+        self.regex_open_pid = re.compile(r'^Server listening on {} port {} with pid (?P<pid>\d+)'.format(self.proto, str(self.dstport)))
+
         self.opened.clear()
         self.remotepid = None
-        iperftime = time + 30
-        self.sshcmd=[self.ssh, self.user + '@' + self.host, self.iperf, '-s', '-p ' + str(self.port), '-e',  '-t ' + str(iperftime), '-z', '-fb', '-w' , self.window]
+        if time :
+            iperftime = time + 30
+            self.sshcmd=[self.ssh, self.user + '@' + self.host, self.iperf, '-s', '-p ' + str(self.dstport), '-e',  '-t ' + str(iperftime), '-z', '-fb', '-w' , self.window]
+        else :
+            self.sshcmd=[self.ssh, self.user + '@' + self.host, self.iperf, '-s', '-p ' + str(self.dstport), '-e',  '-z', '-fb', '-w' , self.window]
         if self.interval >= 0.005 :
             self.sshcmd.extend(['-i ', str(self.interval)])
         if self.proto == 'UDP' :
@@ -531,7 +637,7 @@ class iperf_server(object):
 
 class iperf_client(object):
 
-    # Asycnio protocol for subprocess transport
+    # Asyncio protocol for subprocess transport
     class IperfClientProtocol(asyncio.SubprocessProtocol):
         def __init__(self, client, flow):
             self.__dict__['flow'] = flow
@@ -562,6 +668,7 @@ class iperf_client(object):
                 return
             self._client.closed.set()
             self._client.opened.clear()
+            self._client.txcompleted.set()
 
         def connection_made(self, trans):
             self._client.closed.clear()
@@ -580,13 +687,45 @@ class iperf_client(object):
                     if not self._client.opened.is_set() :
                         m = self._client.regex_open_pid.match(line)
                         if m :
-                            # logging.debug('remote pid match {}'.format(m.group('pid')))
                             self._client.opened.set()
                             self._client.remotepid = m.group('pid')
                             self.flowstats['starttime'] = datetime.now(timezone.utc).astimezone()
                             logging.debug('{} pipe reading at {} (stdout,{})'.format(self._client.name, self.flowstats['starttime'].isoformat(), self._client.remotepid))
                     else :
-                        if self.proto == 'TCP':
+                        if self.flowstats['flowid'] is None :
+                            m = self._client.regex_flowid.match(line)
+                            if m :
+                                # self.regex_flowid = re.compile(r'local\s(?P<srcip>[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3})\sport\s(?P<srcport>[0-9]+)\sconnected with\s(?P<dstip>[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3})\sport\s(?P<dstport>[0-9]+)')
+                                #
+                                # temp = htonl(config->src_ip);
+                                # checksum ^= bcm_compute_xor32((volatile uint32 *)&temp, sizeof(temp) / sizeof(uint32));
+                                # temp = htonl(config->dst_ip);
+                                # checksum ^= bcm_compute_xor32((volatile uint32 *)&temp, sizeof(temp) / sizeof(uint32));
+                                # temp = (hton16(config->dst_port) << 16) | hton16(config->src_port);
+                                # checksum ^= bcm_compute_xor32((volatile uint32 *)&temp, sizeof(temp) / sizeof(uint32));
+                                # temp = config->proto;
+                                # checksum ^= bcm_compute_xor32((volatile uint32 *)&temp, sizeof(temp) / sizeof(uint32));
+                                # return "%08x" % netip
+                                # NOTE: the network or big endian byte order
+                                srcipaddr = ipaddress.ip_address(m.group('srcip'))
+                                srcip32 = ctypes.c_uint32(int.from_bytes(srcipaddr.packed, byteorder='little', signed=False))
+                                dstipaddr = ipaddress.ip_address(m.group('dstip'))
+                                dstip32 = ctypes.c_uint32(int.from_bytes(dstipaddr.packed, byteorder='little', signed=False))
+                                dstportbytestr = int(m.group('dstport')).to_bytes(2, byteorder='big', signed=False)
+                                dstport16 = ctypes.c_uint16(int.from_bytes(dstportbytestr, byteorder='little', signed=False))
+                                srcportbytestr = int(m.group('srcport')).to_bytes(2, byteorder='big', signed=False)
+                                srcport16 = ctypes.c_uint16(int.from_bytes(srcportbytestr, byteorder='little', signed=False))
+                                ports32 = ctypes.c_uint32((dstport16.value << 16) | srcport16.value)
+                                if self._client.proto == 'UDP':
+                                    proto32 = ctypes.c_uint32(0x11)
+                                else :
+                                    proto32 = ctypes.c_uint32(0x06)
+                                quintuplehash = srcip32.value ^ dstip32.value ^ ports32.value ^ proto32.value
+                                self.flowstats['flowid'] = '0x{:08x}'.format(quintuplehash)
+                                iperf_flow.flowid2name[self.flowstats['flowid']] = self._client.name
+                                logging.info('Flow hash = {} uses name {}'.format(self.flowstats['flowid'], self._client.name))
+
+                        if self._client.proto == 'TCP':
                             m = self._client.regex_traffic.match(line)
                             if m :
                                 timestamp = datetime.now()
@@ -614,6 +753,10 @@ class iperf_client(object):
                                 self.flowstats['retry'].append(m.group('retry'))
                                 self.flowstats['cwnd'].append(m.group('cwnd'))
                                 self.flowstats['rtt'].append(m.group('rtt'))
+                            else :
+                                m = self._client.regex_connect_time.match(line)
+                                if m :
+                                    self.flowstats['connect_time'].append(float(m.group('connect_time')))
                         else :
                             pass
 
@@ -647,7 +790,9 @@ class iperf_client(object):
         self.loop = loop
         self.opened = asyncio.Event(loop=self.loop)
         self.closed = asyncio.Event(loop=self.loop)
+        self.txcompleted = asyncio.Event(loop=self.loop)
         self.closed.set()
+        self.txcompleted.clear()
         self.traffic_event = asyncio.Event(loop=self.loop)
         self.name = name
         self.iperf = '/usr/local/bin/iperf'
@@ -658,34 +803,52 @@ class iperf_client(object):
         self._protocol = None
         conn_id = '{}'.format(self.name)
         self.adapter = self.CustomAdapter(logger, {'connid': conn_id})
-        # Client connecting to 192.168.100.33, TCP port 61009 with pid 1903
-        self.regex_open_pid = re.compile(r'Client connecting to .*, {} port {} with pid (?P<pid>\d+)'.format(self.proto, str(self.port)))
         # traffic ex: [  3] 0.00-0.50 sec  655620 Bytes  10489920 bits/sec  14/211        446      446K/0 us
         self.regex_traffic = re.compile(r'\[\s+\d+] (?P<timestamp>.*) sec\s+(?P<bytes>\d+) Bytes\s+(?P<throughput>\d+) bits/sec\s+(?P<writes>\d+)/(?P<errwrites>\d+)\s+(?P<retry>\d+)\s+(?P<cwnd>\d+)K/(?P<rtt>\d+) us')
-
+        self.regex_connect_time = re.compile(r'\[\s+\d+]\slocal.*\(ct=(?P<connect_time>\d+\.\d+) ms\)')
+        # local 192.168.1.4 port 56949 connected with 192.168.1.1 port 61001
+        self.regex_flowid = re.compile(r'\[\s+\d+]\slocal\s(?P<srcip>[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3})\sport\s(?P<srcport>[0-9]+)\sconnected with\s(?P<dstip>[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3}\.[0-9]{0,3})\sport\s(?P<dstport>[0-9]+)')
     def __getattr__(self, attr):
         return getattr(self.flow, attr)
 
-    async def start(self, time=time):
+    async def start(self, time=None, amount=None, parallel=None, triptime=False):
         if not self.closed.is_set() :
             return
 
         self.opened.clear()
+        self.txcompleted.clear()
         self.remotepid = None
+        self.flowstats['flowid']=None
+
+        # Client connecting to 192.168.100.33, TCP port 61009 with pid 1903
+        self.regex_open_pid = re.compile(r'Client connecting to .*, {} port {} with pid (?P<pid>\d+)'.format(self.proto, str(self.dstport)))
+        self.sshcmd=[self.ssh, self.user + '@' + self.host, self.iperf, '-c', self.dstip, '-p ' + str(self.dstport), '-e', '-fb', '-S ', iperf_flow.txt_to_tos(self.tos), '-w' , self.window ,'--realtime']
+        if self.length :
+            self.sshcmd.extend(['-l ', str(self.length)])
         if time:
-            iperftime = time + 30
-        else :
-            ipertime = self.time + 30
-        self.sshcmd=[self.ssh, self.user + '@' + self.host, self.iperf, '-c', self.dst, '-p ' + str(self.port), '-e', '-t ' + str(iperftime), '-z', '-fb', '-S ', iperf_flow.txt_to_tos(self.tos), '-w' , self.window, '-l ' + str(self.length)]
+            self.sshcmd.extend(['-t ', str(time)])
+        elif amount:
+            iperftime = time
+            self.sshcmd.extend(['-n ',  amount])
+        if parallel :
+            self.sshcmd.extend(['-P', str(parallel)])
+        if triptime :
+            self.sshcmd.extend(['--trip-time'])
+
+        if self.srcip :
+            if self.srcport :
+                self.sshcmd.extend(['-B {}:{}'.format(self.srcip, self.srcport)])
+            else :
+                self.sshcmd.extend(['-B {}'.format(self.srcip)])
         if self.udptriggers :
-            self.sshcmd.extend(['-B 192.168.1.3:6001', '--udp-triggers'])
+            self.sshcmd.extend(['--udp-triggers'])
 
         if self.interval >= 0.005 :
             self.sshcmd.extend(['-i ', str(self.interval)])
 
         if self.proto == 'UDP' :
              if self.isoch :
-                 self.sshcmd.extend(['-u', '--isochronous=' + self.offered_load])
+                 self.sshcmd.extend(['-u', '--isochronous=' + self.offered_load + ' --ipg ' + str(self.ipg)])
              else :
                  self.sshcmd.extend(['-u', '-b', self.offered_load])
         elif self.proto == 'TCP' and self.offered_load :
@@ -761,7 +924,7 @@ class flow_histogram(object):
                     fid.write('set terminal png size 1024,768\n')
 
                 fid.write('set key bottom\n')
-                fid.write('set title \"{}\"\n'.format(mytitle))
+                fid.write('set title \"{}\" noenhanced\n'.format(mytitle))
                 if float(uci_val) < 400:
                     fid.write('set format x \"%.2f"\n')
                 else :
@@ -773,33 +936,39 @@ class flow_histogram(object):
                 fid.write('set y2tics nomirror\n')
                 fid.write('set grid\n')
                 fid.write('set xlabel \"time (ms)\\n{} - {}\"\n'.format(h1.starttime, h2.endtime))
+                default_minx = -0.5
                 if float(uci_val) < 0.4:
-                    fid.write('set xrange [0:0.4]\n')
+                    fid.write('set xrange [{}:0.4]\n'.format(default_minx))
                     fid.write('set xtics auto\n')
                 elif h1.max < 2.0 and h2.max < 2.0 :
-                    fid.write('set xrange [0:1]\n')
+                    fid.write('set xrange [{}:2]\n'.format(default_minx))
                     fid.write('set xtics auto\n')
                 elif h1.max < 5.0 and h2.max < 5.0 :
-                    fid.write('set xrange [0:5]\n')
+                    fid.write('set xrange [{}:5]\n'.format(default_minx))
                     fid.write('set xtics auto\n')
                 elif h1.max < 10.0 and h2.max < 10.0:
-                    fid.write('set xrange [0:10]\n')
+                    fid.write('set xrange [{}:10]\n'.format(default_minx))
                     fid.write('set xtics add 1\n')
                 elif h1.max < 20.0 and h2.max < 20.0 :
-                    fid.write('set xrange [0:20]\n')
+                    fid.write('set xrange [{}:20]\n'.format(default_minx))
                     fid.write('set xtics add 1\n')
+                    fid.write('set format x \"%.0f"\n')
                 elif h1.max < 40.0 and h2.max < 40.0:
-                    fid.write('set xrange [0:40]\n')
+                    fid.write('set xrange [{}:40]\n'.format(default_minx))
                     fid.write('set xtics add 5\n')
+                    fid.write('set format x \"%.0f"\n')
                 elif h1.max < 50.0 and h2.max < 50.0:
-                    fid.write('set xrange [0:50]\n')
+                    fid.write('set xrange [{}:50]\n'.format(default_minx))
                     fid.write('set xtics add 5\n')
+                    fid.write('set format x \"%.0f"\n')
                 elif h1.max < 75.0 and h2.max < 75.0:
-                    fid.write('set xrange [0:75]\n')
+                    fid.write('set xrange [{}:75]\n'.format(default_minx))
                     fid.write('set xtics add 5\n')
+                    fid.write('set format x \"%.0f"\n')
                 else :
-                    fid.write('set xrange [0:100]\n')
+                    fid.write('set xrange [{}:100]\n'.format(default_minx))
                     fid.write('set xtics add 10\n')
+                    fid.write('set format x \"%.0f"\n')
                 fid.write('plot \"{0}\" using 1:2 index 0 axes x1y2 with impulses linetype 3 notitle,  \"{1}\" using 1:2 index 0 axes x1y2 with impulses linetype 2 notitle, \"{1}\" using 1:3 index 0 axes x1y1 with lines linetype 1 linewidth 2 notitle, \"{0}\" using 1:3 index 0 axes x1y1 with lines linetype -1 linewidth 2 notitle\n'.format(h1.datafilename, h2.datafilename))
 
             childprocess = await asyncio.create_subprocess_exec(flow_histogram.gnuplot,gpcfilename, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, loop=iperf_flow.loop)
@@ -845,6 +1014,14 @@ class flow_histogram(object):
                 y1 = float(y) / float(self.population)
                 self._entropy -= y1 * math.log2(y1)
         return self._entropy
+
+    @property
+    def ampdu_dump(self) :
+        return self._ampdu_rawdump
+
+    @ampdu_dump.setter
+    def ampdu_dump(self, value):
+        self._ampdu_rawdump = value
 
     async def __exec_gnuplot(self) :
         logging.info('Plotting {} {}'.format(self.name, self.gpcfilename))
@@ -909,9 +1086,9 @@ class flow_histogram(object):
 
                 fid.write('set key bottom\n')
                 if self.ks_index is not None :
-                    fid.write('set title \"{}({}) {}({}) E={}\"\n'.format(self.name, str(self.ks_index), title, int(self.population), self.entropy))
+                    fid.write('set title \"{}({}) {}({}) E={}\" noenhanced\n'.format(self.name, str(self.ks_index), title, int(self.population), self.entropy))
                 else :
-                    fid.write('set title \"{}{}({}) E={}\"\n'.format(self.name, title, int(self.population), self.entropy))
+                    fid.write('set title \"{}{}({}) E={}\" noenhanced\n'.format(self.name, title, int(self.population), self.entropy))
                 fid.write('set format x \"%.0f"\n')
                 fid.write('set format y \"%.1f"\n')
                 fid.write('set yrange [0:1.01]\n')

@@ -64,19 +64,22 @@
 #include "isochronous.hpp"
 #include "pdfs.h"
 #include "version.h"
-#ifdef HAVE_UDPTRIGGERS
-#include "ioctls.h"
-#endif
 
 // const double kSecs_to_usecs = 1e6;
 const double kSecs_to_nsecs = 1e9;
 const int    kBytes_to_Bits = 8;
 
 #define VARYLOAD_PERIOD 0.1 // recompute the variable load every n seconds
+#define MAXUDPBUF 1470
+
+#ifndef INITIAL_PACKETID
+# define INITIAL_PACKETID 0
+#endif
 
 Client::Client( thread_Settings *inSettings ) {
     mSettings = inSettings;
     mBuf = NULL;
+    double ct = -1.0;
 
     if (isCompat(inSettings) && isPeerVerDetect(inSettings)) {
 	fprintf(stderr, "%s", warn_compat_and_peer_exchange);
@@ -97,9 +100,9 @@ Client::Client( thread_Settings *inSettings ) {
 	}
     }
     // initialize buffer
-    mBuf = new char[((mSettings->mBufLen > SIZEOF_MAXHDRMSG) ? mSettings->mBufLen : SIZEOF_MAXHDRMSG)];
+    mBuf = new char[((mSettings->mBufLen > MAXUDPBUF) ? mSettings->mBufLen : MAXUDPBUF)];
     FAIL_errno( mBuf == NULL, "No memory for buffer\n", mSettings );
-    pattern( mBuf, ((mSettings->mBufLen > SIZEOF_MAXHDRMSG) ? mSettings->mBufLen : SIZEOF_MAXHDRMSG));
+    pattern( mBuf, ((mSettings->mBufLen > MAXUDPBUF) ? mSettings->mBufLen : MAXUDPBUF));
     if ( isFileInput( mSettings ) ) {
         if ( !isSTDIN( mSettings ) )
             Extractor_Initialize( mSettings->mFileName, mSettings->mBufLen, mSettings );
@@ -115,7 +118,23 @@ Client::Client( thread_Settings *inSettings ) {
 	FAIL_errno( !(mSettings->mFPS > 0.0), "Invalid value for frames per second in the isochronous settings\n", mSettings );
 #endif
 
-    Connect( );
+#ifdef HAVE_CLOCK_NANOSLEEP
+#ifdef HAVE_CLOCK_GETTIME
+    if (isTxStartTime(inSettings)) {
+	int rc = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &inSettings->txstart, NULL);
+        if (rc) {
+	    fprintf(stderr, "failed clock_nanosleep()=%d\n", rc);
+	} else {
+	    // Mark the epoch start time before the bind call
+	    now.setnow();
+	    mSettings->txstart_epoch.tv_sec = now.getSecs();
+	    mSettings->txstart_epoch.tv_usec = now.getUsecs();
+	}
+    }
+#endif
+#endif
+
+    ct = Connect( );
 
     if ( isReport( inSettings ) ) {
         ReportSettings( inSettings );
@@ -128,17 +147,18 @@ Client::Client( thread_Settings *inSettings ) {
         }
     }
 
-    // InitReport handles Barrier for multiple Streams
-    mSettings->reporthdr = InitReport( mSettings );
+    // InitDataReport handles Barrier for multiple Streams
+    InitReport(mSettings);
+    if (mSettings->reporthdr) {
+	mSettings->reporthdr->report.connection.connecttime = ct;
+    }
 
-    reportstruct = new ReportStruct;
+    reportstruct = new ReportStruct();
     FAIL_errno( reportstruct == NULL, "No memory for report structure\n", mSettings );
-    reportstruct->packetID = (isPeerVerDetect(mSettings)) ? 1 : 0;
-    reportstruct->errwrite=0;
+    reportstruct->packetID = (isPeerVerDetect(mSettings)) ? 1 : INITIAL_PACKETID;
+    reportstruct->errwrite=WriteNoErr;
     reportstruct->emptyreport=0;
     reportstruct->socket = mSettings->mSock;
-    if (isTxSync(mSettings))
-	syncTime.set(mSettings->thread_synctime.tv_sec, mSettings->thread_synctime.tv_usec);
 
 } // end Client
 
@@ -151,9 +171,6 @@ Client::~Client() {
         WARN_errno( rc == SOCKET_ERROR, "close" );
         mSettings->mSock = INVALID_SOCKET;
     }
-#ifdef HAVE_UDPTRIGGERS
-    close_ioctl_sock(mSettings);
-#endif
     DELETE_ARRAY( mBuf );
     DELETE_PTR(reportstruct);
 } // end ~Client
@@ -164,11 +181,13 @@ Client::~Client() {
  * If inLocalhost is not null, bind to that address, specifying
  * which outgoing interface to use.
  * ------------------------------------------------------------------- */
-void Client::Connect( ) {
+double Client::Connect( ) {
     int rc;
+    double connecttime = -1.0;
+
     SockAddr_remoteAddr( mSettings );
 
-    assert( mSettings->inHostname != NULL );
+    assert( mSettings->mHost != NULL );
 
     // create an internet socket
     int type = ( isUDP( mSettings )  ?  SOCK_DGRAM : SOCK_STREAM);
@@ -187,6 +206,7 @@ void Client::Connect( ) {
     SetSocketOptions( mSettings );
 
     SockAddr_localAddr( mSettings );
+
     if ( mSettings->mLocalhost != NULL ) {
         // bind socket to local address
         rc = bind( mSettings->mSock, (sockaddr*) &mSettings->local,
@@ -201,8 +221,16 @@ void Client::Connect( ) {
     }
 
     // connect socket
-    rc = connect( mSettings->mSock, (sockaddr*) &mSettings->peer,
-                  SockAddr_get_sizeof_sockaddr( &mSettings->peer ));
+    if (!isUDP(mSettings) && isEnhanced(mSettings)) {
+	connect_start.setnow();
+	rc = connect( mSettings->mSock, (sockaddr*) &mSettings->peer,
+		      SockAddr_get_sizeof_sockaddr( &mSettings->peer ));
+	connect_done.setnow();
+	connecttime = 1e3 * connect_done.subSec(connect_start);
+    } else {
+	rc = connect( mSettings->mSock, (sockaddr*) &mSettings->peer,
+		      SockAddr_get_sizeof_sockaddr( &mSettings->peer ));
+    }
     FAIL_errno( rc == SOCKET_ERROR, "connect", mSettings );
 
     getsockname( mSettings->mSock, (sockaddr*) &mSettings->local,
@@ -210,6 +238,7 @@ void Client::Connect( ) {
     getpeername( mSettings->mSock, (sockaddr*) &mSettings->peer,
                  &mSettings->size_peer );
     SockAddr_Ifrname(mSettings);
+    return connecttime;
 
 } // end Connect
 
@@ -253,22 +282,29 @@ void Client::InitTrafficLoop (void) {
      *
      * Side note: An advantage of not using interval reports w/TCP is that
      * the code path won't make any clock syscalls in the main loop
+     *
+     * For Dual and TradeOff tests we can't use itimer in the Client
+     * thread because it is executed at both ends, conflicting with
+     * the Server thread's itimer.  The Client process then rejects
+     * the reverse connection, and the Server process exits early.  To
+     * resolve this, only use the itimer mechanism for "Normal" tests.
      */
 
     if (isModeTime(mSettings)) {
 #ifdef HAVE_SETITIMER
-        int err;
-        struct itimerval it;
-	memset (&it, 0, sizeof (it));
-	it.it_value.tv_sec = (int) (mSettings->mAmount / 100.0);
-	it.it_value.tv_usec = (int) (10000 * (mSettings->mAmount -
-					      it.it_value.tv_sec * 100.0));
-	err = setitimer( ITIMER_REAL, &it, NULL );
-	FAIL_errno( err != 0, "setitimer", mSettings );
-#else
+        if (mSettings->mMode == kTest_Normal) {
+	    int err;
+	    struct itimerval it;
+	    memset (&it, 0, sizeof (it));
+	    it.it_value.tv_sec = (int) (mSettings->mAmount / 100.0);
+	    it.it_value.tv_usec = (int) (10000 * (mSettings->mAmount -
+						  it.it_value.tv_sec * 100.0));
+	    err = setitimer( ITIMER_REAL, &it, NULL );
+	    FAIL_errno( err != 0, "setitimer", mSettings );
+	}
+#endif
         mEndTime.setnow();
         mEndTime.add( mSettings->mAmount / 100.0 );
-#endif
     }
 
     lastPacketTime.setnow();
@@ -287,6 +323,8 @@ void Client::InitTrafficLoop (void) {
  * ------------------------------------------------------------------- */
 void Client::Run( void ) {
 
+    // Post the very first report which will have connection, version and test information
+    PostFirstReport(mSettings);
     // Peform common traffic setup
     InitTrafficLoop();
     /*
@@ -318,8 +356,6 @@ void Client::Run( void ) {
 	// Launch the approprate UDP traffic loop
 	if (isIsochronous(mSettings)) {
 	    RunUDPIsochronous();
-	} else if (isTxSync(mSettings)) {
-	    RunUDPTxSync();
 	} else {
 	    RunUDP();
 	}
@@ -335,34 +371,38 @@ void Client::Run( void ) {
 /*
  * TCP send loop
  */
+
+
 void Client::RunTCP( void ) {
     int currLen = 0;
 
     while (InProgress()) {
         // perform write
-	reportstruct->errwrite=0;
-        currLen = write( mSettings->mSock, mBuf, mSettings->mBufLen );
+        if (!isModeTime(mSettings)) {
+	    currLen = write( mSettings->mSock, mBuf, (mSettings->mAmount < (unsigned) mSettings->mBufLen) ? mSettings->mAmount : mSettings->mBufLen);
+	} else {
+	    currLen = write( mSettings->mSock, mBuf, mSettings->mBufLen);
+	}
         if ( currLen < 0 ) {
-	    reportstruct->errwrite=1;
-	    currLen = 0;
-	    if (
-#ifdef WIN32
-		(errno = WSAGetLastError()) != WSAETIMEDOUT
-#else
-		errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR
-#endif
-		) {
+	    if (NONFATALTCPWRITERR(errno)) {
+	        reportstruct->errwrite=WriteErrAccount;
+	    } else if (FATALTCPWRITERR(errno)) {
+	        reportstruct->errwrite=WriteErrFatal;
 	        WARN_errno( 1, "write" );
-	        break;
+		break;
+	    } else {
+	        reportstruct->errwrite=WriteErrNoAccount;
 	    }
-        }
-
-	totLen += currLen;
-
+	    currLen = 0;
+	} else {
+	    totLen += currLen;
+	    reportstruct->errwrite=WriteNoErr;
+	}
 // skip the packet time setting syscall() for the case of no interval reporting
 // or packet reporting needed and an itimer is available to stop the traffic/while loop
 #ifdef HAVE_SETITIMER
-	if ((mSettings->mInterval > 0) || isEnhanced(mSettings))
+	if ((mSettings->mInterval > 0) || isEnhanced(mSettings) ||
+	    mSettings->mMode != kTest_Normal)
 #endif
 	{
 	    now.setnow();
@@ -397,7 +437,8 @@ void Client::RunRateLimitedTCP ( void ) {
     Timestamp time1, time2;
 
     int var_rate = mSettings->mUDPRate;
-    while (InProgress()) {
+    int fatalwrite_err = 0;
+    while (InProgress() && !fatalwrite_err) {
 	// Add tokens per the loop time
 	// clock_gettime is much cheaper than gettimeofday() so
 	// use it if possible.
@@ -415,25 +456,29 @@ void Client::RunRateLimitedTCP ( void ) {
 	time1 = time2;
 	if (tokens >= 0.0) {
 	    // perform write
-	    reportstruct->errwrite=0;
-	    currLen = write( mSettings->mSock, mBuf, mSettings->mBufLen );
-	    if ( currLen < 0 ) {
-		reportstruct->errwrite=1;
-		currLen = 0;
-		if (
-#ifdef WIN32
-		    (errno = WSAGetLastError()) != WSAETIMEDOUT
-#else
-		    errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR
-#endif
-		    ) {
-		    WARN_errno( 1 , "write");
-		    break;
-		}
+	    if (!isModeTime(mSettings)) {
+	        currLen = write( mSettings->mSock, mBuf, (mSettings->mAmount < (unsigned) mSettings->mBufLen) ? mSettings->mAmount : mSettings->mBufLen);
+	    } else {
+	        currLen = write( mSettings->mSock, mBuf, mSettings->mBufLen);
 	    }
-	    // Consume tokens per the transmit
-	    tokens -= currLen;
-	    totLen += currLen;
+	    if ( currLen < 0 ) {
+	        if (NONFATALTCPWRITERR(errno)) {
+		    reportstruct->errwrite=WriteErrAccount;
+		} else if (FATALTCPWRITERR(errno)) {
+		    reportstruct->errwrite=WriteErrFatal;
+		    WARN_errno( 1, "write" );
+		    fatalwrite_err = 1;
+		    break;
+		} else {
+		    reportstruct->errwrite=WriteErrNoAccount;
+	        }
+	        currLen = 0;
+	    } else {
+	      // Consume tokens per the transmit
+	        tokens -= currLen;
+	        totLen += currLen;
+		reportstruct->errwrite=WriteNoErr;
+	    }
 	    time2.setnow();
 	    reportstruct->packetTime.tv_sec = time2.getSecs();
 	    reportstruct->packetTime.tv_usec = time2.getUsecs();
@@ -514,15 +559,10 @@ void Client::RunUDP( void ) {
 	    }
 	}
 	// store datagram ID into buffer
-	WritePacketID();
+	WritePacketID(reportstruct->packetID++);
 	mBuf_UDP->tv_sec  = htonl(reportstruct->packetTime.tv_sec);
 	mBuf_UDP->tv_usec = htonl(reportstruct->packetTime.tv_usec);
 
-	if (!isSeqNo64b(mSettings) && (reportstruct->packetID & 0x80000000L)) {
-	    // seqno wrapped
-	    fprintf(stderr, "%s", warn_seqno_wrap);
-	    break;
-	}
 	// Adjustment for the running delay
 	// o measure how long the last loop iteration took
 	// o calculate the delay adjust
@@ -552,28 +592,34 @@ void Client::RunUDP( void ) {
 	    delay = delay_target;
 	}
 
-	reportstruct->errwrite = 0;
+	reportstruct->errwrite = WriteNoErr;
 	reportstruct->emptyreport = 0;
 
 	// perform write
-	currLen = write( mSettings->mSock, mBuf, mSettings->mBufLen );
+	if (!isModeTime(mSettings)) {
+	    currLen = write( mSettings->mSock, mBuf, (mSettings->mAmount < (unsigned) mSettings->mBufLen) ? mSettings->mAmount : mSettings->mBufLen);
+	} else {
+	    currLen = write( mSettings->mSock, mBuf, mSettings->mBufLen);
+	}
 	if ( currLen < 0 ) {
 	    reportstruct->packetID--;
-	    reportstruct->errwrite = 1;
-	    reportstruct->emptyreport = 1;
-	    currLen = 0;
-	    if (
-#ifdef WIN32
-		(errno = WSAGetLastError()) != WSAETIMEDOUT &&
-		errno != WSAECONNREFUSED
-#else
-		errno != EAGAIN && errno != EWOULDBLOCK &&
-		errno != EINTR  && errno != ECONNREFUSED &&
-		errno != ENOBUFS
-#endif
-		) {
-		WARN_errno( 1, "write" );
+	    if (FATALUDPWRITERR(errno)) {
+	        reportstruct->errwrite = WriteErrFatal;
+	        WARN_errno( 1, "write" );
 		break;
+	    } else {
+	        reportstruct->errwrite = WriteErrAccount;
+	        currLen = 0;
+	    }
+	  reportstruct->emptyreport = 1;
+	}
+
+	if (!isModeTime(mSettings)) {
+	    /* mAmount may be unsigned, so don't let it underflow! */
+	    if( mSettings->mAmount >= (unsigned long) currLen ) {
+	        mSettings->mAmount -= (unsigned long) currLen;
+	    } else {
+	        mSettings->mAmount = 0;
 	    }
 	}
 
@@ -587,15 +633,6 @@ void Client::RunUDP( void ) {
 	    // and invoke the microsecond delay
 	    delay_loop((unsigned long) (delay / 1000));
 	}
-	if (!isModeTime(mSettings)) {
-	    /* mAmount may be unsigned, so don't let it underflow! */
-	    if( mSettings->mAmount >= (unsigned long) currLen ) {
-		mSettings->mAmount -= (unsigned long) currLen;
-	    } else {
-		mSettings->mAmount = 0;
-	    }
-	}
-
     }
 
     FinishTrafficActions();
@@ -622,26 +659,28 @@ void Client::RunUDPIsochronous (void) {
     int currLen = 1;
     int frameid=0;
     Timestamp t1;
-    int bytecntmin = sizeof(UDP_datagram) + sizeof(client_hdr_udp_tests);
+    int bytecntmin;
+    // make sure the packet can carry the isoch payload
+    if (isModeTime(mSettings)) {
+	bytecntmin = sizeof(UDP_datagram) + sizeof(client_hdr_v1) + sizeof(struct client_hdr_udp_isoch_tests);
+    } else {
+	bytecntmin = 1;
+    }
 
     mBuf_isoch->burstperiod = htonl(fc->period_us());
-    if (isTxSync(mSettings))
-	fc->wait_sync(mSettings->thread_synctime.tv_sec, mSettings->thread_synctime.tv_usec);
 
     int initdone = 0;
-
-    while (InProgress()) {
+    int fatalwrite_err = 0;
+    while (InProgress() && !fatalwrite_err) {
 	int bytecnt = (int) (lognormal(mSettings->mMean,mSettings->mVariance)) / (mSettings->mFPS * 8);
+	if (bytecnt < bytecntmin)
+	    bytecnt = bytecntmin;
 	delay = 0;
 
 	// printf("bits=%d\n", (int) (mSettings->mFPS * bytecnt * 8));
-	// adjust bytecnt so last packet of burst is greater or equal to min packet
-	int remainder = bytecnt % mSettings->mBufLen;
-	if (remainder < bytecntmin) {
-	    bytecnt += (bytecntmin - remainder);
-	}
 	mBuf_isoch->burstsize  = htonl(bytecnt);
 	mBuf_isoch->prevframeid  = htonl(frameid);
+	reportstruct->burstsize=bytecnt;
 	frameid =  fc->wait_tick();
 	mBuf_isoch->frameid  = htonl(frameid);
 	lastPacketTime.setnow();
@@ -651,19 +690,14 @@ void Client::RunUDPIsochronous (void) {
 	    mBuf_isoch->start_tv_usec = htonl(fc->getUsecs());
 	}
 
-	while ((bytecnt > 0) && InProgress()) {				\
+	while ((bytecnt > 0) && InProgress()) {
 	    t1.setnow();
 	    reportstruct->packetTime.tv_sec = t1.getSecs();
 	    reportstruct->packetTime.tv_usec = t1.getUsecs();
 	    mBuf_UDP->tv_sec  = htonl(reportstruct->packetTime.tv_sec);
 	    mBuf_UDP->tv_usec = htonl(reportstruct->packetTime.tv_usec);
-	    WritePacketID();
+	    WritePacketID(reportstruct->packetID++);
 
-	    if (!isSeqNo64b(mSettings) && (reportstruct->packetID & 0x80000000L)) {
-		// seqno wrapped
-		fprintf(stderr, "%s", warn_seqno_wrap);
-		break;
-	    }
 	    // Adjustment for the running delay
 	    // o measure how long the last loop iteration took
 	    // o calculate the delay adjust
@@ -693,33 +727,49 @@ void Client::RunUDPIsochronous (void) {
 	    //	  delay = delay_target;
 	    // }
 
-	    reportstruct->errwrite = 0;
+	    reportstruct->errwrite = WriteNoErr;
 	    reportstruct->emptyreport = 0;
-	    mBuf_isoch->remaining = htonl(bytecnt);
+
 	    // perform write
-	    currLen = write(mSettings->mSock, mBuf, (bytecnt > mSettings->mBufLen) ? mSettings->mBufLen : bytecnt);
+	    if (!isModeTime(mSettings) && (mSettings->mAmount < (unsigned) mSettings->mBufLen)) {
+	        mBuf_isoch->remaining = htonl(mSettings->mAmount);
+		reportstruct->remaining=mSettings->mAmount;
+	        currLen = write(mSettings->mSock, mBuf, mSettings->mAmount);
+	    } else {
+	        mBuf_isoch->remaining = htonl(bytecnt);
+		reportstruct->remaining=bytecnt;
+	        currLen = write(mSettings->mSock, mBuf, (bytecnt < mSettings->mBufLen) ? bytecnt : mSettings->mBufLen);
+	    }
+
 	    if ( currLen < 0 ) {
-		reportstruct->packetID--;
-		reportstruct->errwrite = 1;
+	        reportstruct->packetID--;
 		reportstruct->emptyreport = 1;
-		currLen = 0;
-		if (
-#ifdef WIN32
-		    (errno = WSAGetLastError()) != WSAETIMEDOUT &&
-		    errno != WSAECONNREFUSED
-#else
-		    errno != EAGAIN && errno != EWOULDBLOCK &&
-		    errno != EINTR  && errno != ECONNREFUSED &&
-		    errno != ENOBUFS
-#endif
-		    ) {
-		    WARN_errno( 1, "write" );
-		    break;
+		if (FATALUDPWRITERR(errno)) {
+	            reportstruct->errwrite = WriteErrFatal;
+	            WARN_errno( 1, "write" );
+		    fatalwrite_err = 1;
+	        } else {
+		    reportstruct->errwrite = WriteErrAccount;
+		    currLen = 0;
 		}
 	    } else {
 		bytecnt -= currLen;
+		// adjust bytecnt so last packet of burst is greater or equal to min packet
+		if ((bytecnt > 0) && (bytecnt < bytecntmin)) {
+		    bytecnt = bytecntmin;
+		    mBuf_isoch->burstsize  = htonl(bytecnt);
+		    reportstruct->burstsize=bytecnt;
+		}
 	    }
 
+	    if (!isModeTime(mSettings)) {
+	        /* mAmount may be unsigned, so don't let it underflow! */
+	        if( mSettings->mAmount >= (unsigned long) currLen ) {
+		    mSettings->mAmount -= (unsigned long) currLen;
+		} else {
+		    mSettings->mAmount = 0;
+		}
+	    }
 	    // report packets
 
 	    reportstruct->frameID=frameid;
@@ -743,71 +793,29 @@ void Client::RunUDPIsochronous (void) {
 }
 // end RunUDPIsoch
 
-void Client::RunUDPTxSync (void) {
-    struct UDP_datagram* mBuf_UDP = (struct UDP_datagram*) mBuf;
-    Timestamp t1;
-    int currLen = 0;
-    Isochronous::FrameCounter *fc = NULL;
-
-    fc = new Isochronous::FrameCounter(1.0 / mSettings->mTxSyncInterval);
-    fc->wait_sync(mSettings->thread_synctime.tv_sec, mSettings->thread_synctime.tv_usec);
-
-    while (InProgress()) {
-	fc->wait_tick();
-	t1.setnow();
-	reportstruct->packetTime.tv_sec = t1.getSecs();
-	reportstruct->packetTime.tv_usec = t1.getUsecs();
-	mBuf_UDP->tv_sec  = htonl(reportstruct->packetTime.tv_sec);
-	mBuf_UDP->tv_usec = htonl(reportstruct->packetTime.tv_usec);
-	WritePacketID();
-
-	if (!isSeqNo64b(mSettings) && (reportstruct->packetID & 0x80000000L)) {
-	    // seqno wrapped
-	    fprintf(stderr, "%s", warn_seqno_wrap);
-	    break;
-	}
-	reportstruct->errwrite = 0;
-	reportstruct->emptyreport = 0;
-	// perform write
-	currLen = write(mSettings->mSock, mBuf, mSettings->mBufLen);
-	if ( currLen < 0 ) {
-	    reportstruct->packetID--;
-	    reportstruct->errwrite = 1;
-	    reportstruct->emptyreport = 1;
-	    currLen = 0;
-	    if (
-#ifdef WIN32
-		(errno = WSAGetLastError()) != WSAETIMEDOUT &&
-		errno != WSAECONNREFUSED
-#else
-		errno != EAGAIN && errno != EWOULDBLOCK &&
-		errno != EINTR  && errno != ECONNREFUSED &&
-		errno != ENOBUFS
-#endif
-		) {
-		WARN_errno( 1, "write" );
-		break;
-	    }
-	}
-	reportstruct->packetLen = (unsigned long) currLen;
-	ReportPacket( mSettings->reporthdr, reportstruct );
-    }
-
-    FinishTrafficActions();
-
-    DELETE_PTR(fc);
-}
-// end RunUDPTxSync
 
 
-void Client::WritePacketID (void) {
+void Client::WritePacketID (intmax_t packetID) {
     struct UDP_datagram * mBuf_UDP = (struct UDP_datagram *) mBuf;
     // store datagram ID into buffer
-    mBuf_UDP->id = htonl((reportstruct->packetID & 0xFFFFFFFFL));
-    if (isSeqNo64b(mSettings)) {
-	mBuf_UDP->id2 = htonl(((reportstruct->packetID & 0xFFFFFFFF00000000LL) >> 32));
-    }
-    reportstruct->packetID++;
+#ifdef HAVE_INT64_T
+    // Pack signed 64bit packetID into unsigned 32bit id1 + unsigned
+    // 32bit id2.  A legacy server reading only id1 will still be able
+    // to reconstruct a valid signed packet ID number up to 2^31.
+    uint32_t id1, id2;
+    id1 = packetID & 0xFFFFFFFFLL;
+    id2 = (packetID  & 0xFFFFFFFF00000000LL) >> 32;
+
+    mBuf_UDP->id = htonl(id1);
+    mBuf_UDP->id2 = htonl(id2);
+
+#ifdef SHOW_PACKETID
+    printf("id %" PRIdMAX " (0x%" PRIxMAX ") -> 0x%x, 0x%x\n",
+	   packetID, packetID, id1, id2);
+#endif
+#else
+    mBuf_UDP->id = htonl((reportstruct->packetID));
+#endif
 }
 
 bool Client::InProgress (void) {
@@ -821,16 +829,11 @@ bool Client::InProgress (void) {
 	    return false;
     }
 
-#ifdef HAVE_SETITIMER
-    if (sInterupted ||
-	(!isModeTime(mSettings) && (mSettings->mAmount <= 0)))
-	return false;
-#else
     if (sInterupted ||
 	(isModeTime(mSettings) &&  mEndTime.before(reportstruct->packetTime))  ||
 	(!isModeTime(mSettings) && (mSettings->mAmount <= 0)))
 	return false;
-#endif
+
     return true;
 }
 
@@ -858,6 +861,11 @@ void Client::FinishTrafficActions(void) {
 	ReportPacket( mSettings->reporthdr, reportstruct );
     }
     CloseReport( mSettings->reporthdr, reportstruct );
+    if (isEnhanced(mSettings) && mSettings->mSock != INVALID_SOCKET ) {
+        int rc = close( mSettings->mSock );
+        WARN_errno( rc == SOCKET_ERROR, "close" );
+        mSettings->mSock = INVALID_SOCKET;
+    }
     EndReport( mSettings->reporthdr );
 }
 
@@ -874,13 +882,7 @@ void Client::FinalUDPHandshake(void) {
     // but didn't count our first datagram, so we're even now.
     // The negative datagram ID signifies termination to the server.
 
-    // store datagram ID into buffer
-    if (isSeqNo64b(mSettings)) {
-	mBuf_UDP->id      = htonl((reportstruct->packetID & 0xFFFFFFFFL));
-	mBuf_UDP->id2     = htonl((((reportstruct->packetID & 0xFFFFFFFF00000000LL) >> 32) | 0x80000000L));
-    } else {
-	mBuf_UDP->id      = htonl(((reportstruct->packetID & 0xFFFFFFFFL) | 0x80000000L));
-    }
+    WritePacketID(-reportstruct->packetID);
     mBuf_UDP->tv_usec = htonl( reportstruct->packetTime.tv_usec );
 
     if ( isMulticast( mSettings ) ) {
@@ -897,10 +899,8 @@ void Client::write_UDP_FIN (void) {
     int rc;
     fd_set readSet;
     struct timeval timeout;
-    struct UDP_datagram* mBuf_UDP = (struct UDP_datagram*) mBuf;
 
     int count = 0;
-    int packetid;
     while ( count < 10 ) {
         count++;
 
@@ -915,8 +915,7 @@ void Client::write_UDP_FIN (void) {
         // If the retries weren't decrement here the server can get out
         // of order packets per these retries actually being received
         // by the server (e.g. -1000, -1000, -1000)
-	packetid = ntohl(mBuf_UDP->id);
-        mBuf_UDP->id = htonl(--packetid);
+	WritePacketID(-(++reportstruct->packetID));
 
         // wait until the socket is readable, or our timeout expires
         FD_ZERO( &readSet );
@@ -931,8 +930,10 @@ void Client::write_UDP_FIN (void) {
             // select timed out
             continue;
         } else {
-            // socket ready to read
-            rc = read( mSettings->mSock, mBuf, mSettings->mBufLen );
+            // socket ready to read, this packet size
+	    // is set by the server.  Assume it's large enough
+	    // to contain the final server packet
+            rc = read( mSettings->mSock, mBuf, MAXUDPBUF);
 	    WARN_errno( rc < 0, "read" );
 	    if ( rc < 0 ) {
                 break;
@@ -960,11 +961,23 @@ void Client::InitiateServer() {
             temp_hdr = (client_hdr*)mBuf;
         }
 	flags = Settings_GenerateClientHdr( mSettings, temp_hdr );
+
 	if (flags & (HEADER_EXTEND | HEADER_VERSION1)) {
 	    //  This test requires the pre-test header messages
 	    //  The extended headers require an exchange
 	    //  between the client and server/listener
 	    HdrXchange(flags);
+	}
+	if (!isUDP(mSettings) && isTripTime(mSettings)) {
+	    int inLen = (3 * sizeof(uint32_t));
+	    char buf[inLen];
+	    uint32_t *timers = (uint32_t *) buf;
+	    Timestamp t1;
+	    *timers++ = htonl(HEADER_TIMESTAMP);
+	    *timers++ = htonl(t1.getSecs());
+	    *timers++ = htonl(t1.getUsecs());
+	    int currLen = send( mSettings->mSock, buf, inLen, 0 );
+	    WARN_errno( currLen < 0, "send connect timestamps" );
 	}
     }
 }

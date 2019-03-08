@@ -167,67 +167,7 @@ int main( int argc, char **argv ) {
     Settings_ParseCommandLine( argc, argv, ext_gSettings );
 
     // Check for either having specified client or server
-    if ( ext_gSettings->mThreadMode == kMode_Client
-         || ext_gSettings->mThreadMode == kMode_Listener ) {
-#ifdef WIN32
-        // Start the server as a daemon
-        if ( isDaemon( ext_gSettings )) {
-	    if (ext_gSettings->mThreadMode == kMode_Listener) {
-		CmdInstallService(argc, argv);
-	    } else {
-		fprintf(stderr, "Client cannot be run as a daemon\n");
-	    }
-            return 0;
-        }
-
-        // Remove the Windows service if requested
-        if ( isRemoveService( ext_gSettings ) ) {
-            // remove the service
-            if ( CmdRemoveService() ) {
-                fprintf(stderr, "IPerf Service is removed.\n");
-                return 0;
-            }
-        }
-#else
-	if ( isDaemon( ext_gSettings ) ) {
-	    if (ext_gSettings->mThreadMode != kMode_Listener) {
-		fprintf(stderr, "Iperf client cannot be run as a daemon\n");
-		return 0;
-	    }
-	    if (daemon(1, 1) < 0) {
-	        perror("daemon");
-	    }
-	    fprintf( stderr, "Running Iperf Server as a daemon\n");
-	    fprintf( stderr, "The Iperf daemon process ID : %d\n",((int)getpid()));
-	    fclose(stdout);
-	    fclose(stderr);
-	    fclose(stdin);
-	}
-#endif
-        // initialize client(s)
-        if ( ext_gSettings->mThreadMode == kMode_Client ) {
-            client_init( ext_gSettings );
-        }
-
-#ifdef HAVE_THREAD
-        // start up the reporter and client(s) or listener
-        {
-            thread_Settings *into = NULL;
-            // Create the settings structure for the reporter thread
-            Settings_Copy( ext_gSettings, &into );
-            into->mThreadMode = kMode_Reporter;
-
-            // Have the reporter launch the client or listener
-            into->runNow = ext_gSettings;
-
-            // Start all the threads that are ready to go
-            thread_start( into );
-        }
-#else
-        // No need to make a reporter thread because we don't have threads
-        thread_start( ext_gSettings );
-#endif
-    } else {
+    if ((ext_gSettings->mThreadMode != kMode_Client) && (ext_gSettings->mThreadMode != kMode_Listener)) {
         // neither server nor client mode was specified
         // print usage and exit
 
@@ -236,20 +176,87 @@ int main( int argc, char **argv ) {
         // Starting in 2.0 to restart a previously defined service
         // you must call iperf with "iperf -D" or using the environment variable
         SERVICE_TABLE_ENTRY dispatchTable[] =
-        {
-            { (LPSTR)TEXT(SZSERVICENAME), (LPSERVICE_MAIN_FUNCTION)service_main},
-            { NULL, NULL}
-        };
+	    {
+		{ (LPSTR)TEXT(SZSERVICENAME), (LPSERVICE_MAIN_FUNCTION)service_main},
+		{ NULL, NULL}
+	    };
 
 	// starting the service by SCM, there is no arguments will be passed in.
 	// the arguments will pass into Service_Main entry.
         if (!StartServiceCtrlDispatcher(dispatchTable) )
             // If the service failed to start then print usage
 #endif
-        fprintf( stderr, usage_short, argv[0], argv[0] );
-
-        return 0;
+	    fprintf( stderr, usage_short, argv[0], argv[0] );
+	return 0;
     }
+
+
+    switch (ext_gSettings->mThreadMode) {
+    case kMode_Client :
+	if ( isDaemon( ext_gSettings ) ) {
+	    fprintf(stderr, "Iperf client cannot be run as a daemon\n");
+	    return 0;
+	}
+        // initialize client(s)
+        client_init( ext_gSettings );
+#ifdef HAVE_CLOCK_NANOSLEEP
+#ifdef HAVE_CLOCK_GETTIME
+	if (isEnhanced(ext_gSettings) && isTxStartTime(ext_gSettings)) {
+	    struct timespec t1;
+	    clock_gettime(CLOCK_REALTIME, &t1);
+	    fprintf(stdout, "Client thread(s) traffic start time %ld.%.9ld current time is %ld.%.9ld (epoch/unix format)\n",ext_gSettings->txstart.tv_sec, ext_gSettings->txstart.tv_nsec, t1.tv_sec, t1.tv_nsec);
+	}
+#endif
+#endif
+	break;
+    case kMode_Listener :
+#ifdef WIN32
+     // Remove the Windows service if requested
+	if ( isRemoveService( ext_gSettings ) ) {
+	    // remove the service
+	    if ( CmdRemoveService() ) {
+		fprintf(stderr, "IPerf Service is removed.\n");
+	    }
+	}
+	if ( isDaemon( ext_gSettings ) ) {
+	    CmdInstallService(argc, argv);
+	} else if (isRemoveService(ext_gSettings)) {
+	    return 0;
+	}
+#else // *nix system
+	if ( isDaemon( ext_gSettings ) ) {
+	    fprintf( stderr, "Running Iperf Server as a daemon\n");
+	    // Start the server as a daemon
+	    fflush(stderr);
+	    // redirect stdin, stdout and sterr to /dev/null (see dameon and no close flag)
+	    if (daemon(1, 0) < 0) {
+	        perror("daemon");
+	    }
+	}
+#endif
+	break;
+    default :
+	fprintf( stderr, "unknown mode");
+	break;
+    }
+#ifdef HAVE_THREAD
+        // start up the reporter and client(s) or listener
+    {
+	thread_Settings *into = NULL;
+	// Create the settings structure for the reporter thread
+	Settings_Copy( ext_gSettings, &into );
+	into->mThreadMode = kMode_Reporter;
+
+	// Have the reporter launch the client or listener
+	into->runNow = ext_gSettings;
+
+	// Start all the threads that are ready to go
+	thread_start( into );
+    }
+#else
+    // No need to make a reporter thread because we don't have threads
+    thread_start( ext_gSettings );
+#endif
 
     // wait for other (client, server) threads to complete
     thread_joinall();
@@ -268,7 +275,7 @@ void Sig_Interupt( int inSigno ) {
     // We try to not allow a single interrupt handled by multiple threads
     // to completely kill the app so we save off the first thread ID
     // then that is the only thread that can supply the next interrupt
-    if ( thread_equalid( sThread, thread_zeroid() ) ) {
+    if ( (inSigno == SIGINT) && thread_equalid( sThread, thread_zeroid() ) ) {
         sThread = thread_getid();
     } else if ( thread_equalid( sThread, thread_getid() ) ) {
         sig_exit( inSigno );
@@ -420,9 +427,3 @@ VOID ServiceStop() {
 }
 
 #endif
-
-
-
-
-
-

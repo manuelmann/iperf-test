@@ -90,9 +90,9 @@ build_triplet = @build@
 host_triplet = @host@
 bin_PROGRAMS = iperf$(EXEEXT)
 @CHECKPROGRAMS_TRUE@noinst_PROGRAMS = checkdelay$(EXEEXT) \
-@CHECKPROGRAMS_TRUE@	checkpdfs$(EXEEXT) checkisoch$(EXEEXT)
+@CHECKPROGRAMS_TRUE@	checkpdfs$(EXEEXT) checkisoch$(EXEEXT) \
+@CHECKPROGRAMS_TRUE@	igmp_querier$(EXEEXT)
 @AF_PACKET_TRUE@am__append_1 = checksums.c
-@UDPTRIGGERS_TRUE@am__append_2 = ioctls.c
 subdir = src
 ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
 am__aclocal_m4_deps = $(top_srcdir)/m4/ax_create_stdint_h.m4 \
@@ -124,14 +124,17 @@ am__checkpdfs_SOURCES_DIST = pdfs.c checkpdfs.c stdio.c
 @CHECKPROGRAMS_TRUE@	checkpdfs.$(OBJEXT) stdio.$(OBJEXT)
 checkpdfs_OBJECTS = $(am_checkpdfs_OBJECTS)
 checkpdfs_DEPENDENCIES =
+am__igmp_querier_SOURCES_DIST = igmp_querier.c
+@CHECKPROGRAMS_TRUE@am_igmp_querier_OBJECTS = igmp_querier.$(OBJEXT)
+igmp_querier_OBJECTS = $(am_igmp_querier_OBJECTS)
+igmp_querier_LDADD = $(LDADD)
 am__iperf_SOURCES_DIST = Client.cpp Extractor.c isochronous.cpp \
 	Launch.cpp List.cpp Listener.cpp Locale.c PerfSocket.cpp \
 	ReportCSV.c ReportDefault.c Reporter.c Server.cpp Settings.cpp \
 	SocketAddr.c gnu_getopt.c gnu_getopt_long.c histogram.c \
 	main.cpp service.c sockets.c stdio.c tcp_window_size.c pdfs.c \
-	checksums.c ioctls.c
+	checksums.c
 @AF_PACKET_TRUE@am__objects_1 = checksums.$(OBJEXT)
-@UDPTRIGGERS_TRUE@am__objects_2 = ioctls.$(OBJEXT)
 am_iperf_OBJECTS = Client.$(OBJEXT) Extractor.$(OBJEXT) \
 	isochronous.$(OBJEXT) Launch.$(OBJEXT) List.$(OBJEXT) \
 	Listener.$(OBJEXT) Locale.$(OBJEXT) PerfSocket.$(OBJEXT) \
@@ -140,7 +143,7 @@ am_iperf_OBJECTS = Client.$(OBJEXT) Extractor.$(OBJEXT) \
 	gnu_getopt.$(OBJEXT) gnu_getopt_long.$(OBJEXT) \
 	histogram.$(OBJEXT) main.$(OBJEXT) service.$(OBJEXT) \
 	sockets.$(OBJEXT) stdio.$(OBJEXT) tcp_window_size.$(OBJEXT) \
-	pdfs.$(OBJEXT) $(am__objects_1) $(am__objects_2)
+	pdfs.$(OBJEXT) $(am__objects_1)
 iperf_OBJECTS = $(am_iperf_OBJECTS)
 iperf_DEPENDENCIES = $(am__DEPENDENCIES_1)
 iperf_LINK = $(CXXLD) $(AM_CXXFLAGS) $(CXXFLAGS) $(iperf_LDFLAGS) \
@@ -187,10 +190,10 @@ am__v_CXXLD_ = $(am__v_CXXLD_@AM_DEFAULT_V@)
 am__v_CXXLD_0 = @echo "  CXXLD   " $@;
 am__v_CXXLD_1 = 
 SOURCES = $(checkdelay_SOURCES) $(checkisoch_SOURCES) \
-	$(checkpdfs_SOURCES) $(iperf_SOURCES)
+	$(checkpdfs_SOURCES) $(igmp_querier_SOURCES) $(iperf_SOURCES)
 DIST_SOURCES = $(am__checkdelay_SOURCES_DIST) \
 	$(am__checkisoch_SOURCES_DIST) $(am__checkpdfs_SOURCES_DIST) \
-	$(am__iperf_SOURCES_DIST)
+	$(am__igmp_querier_SOURCES_DIST) $(am__iperf_SOURCES_DIST)
 am__can_run_installinfo = \
   case $$AM_UPDATE_INFO_DIR in \
     n|no|NO) false;; \
@@ -345,13 +348,14 @@ iperf_SOURCES = Client.cpp Extractor.c isochronous.cpp Launch.cpp \
 	ReportDefault.c Reporter.c Server.cpp Settings.cpp \
 	SocketAddr.c gnu_getopt.c gnu_getopt_long.c histogram.c \
 	main.cpp service.c sockets.c stdio.c tcp_window_size.c pdfs.c \
-	$(am__append_1) $(am__append_2)
+	$(am__append_1)
 iperf_LDADD = $(LIBCOMPAT_LDADDS)
 @CHECKPROGRAMS_TRUE@checkdelay_SOURCES = checkdelay.c
 @CHECKPROGRAMS_TRUE@checkdelay_LDADD = $(LIBCOMPAT_LDADDS)
 @CHECKPROGRAMS_TRUE@checkpdfs_SOURCES = pdfs.c checkpdfs.c stdio.c
 @CHECKPROGRAMS_TRUE@checkpdfs_LDADD = -lm
 @CHECKPROGRAMS_TRUE@checkisoch_SOURCES = checkisoch.cpp isochronous.cpp pdfs.c stdio.c
+@CHECKPROGRAMS_TRUE@igmp_querier_SOURCES = igmp_querier.c
 @CHECKPROGRAMS_TRUE@checkisoch_LDADD = $(LIBCOMPAT_LDADDS)
 all: all-am
 
@@ -444,6 +448,10 @@ checkpdfs$(EXEEXT): $(checkpdfs_OBJECTS) $(checkpdfs_DEPENDENCIES) $(EXTRA_check
 	@rm -f checkpdfs$(EXEEXT)
 	$(AM_V_CCLD)$(LINK) $(checkpdfs_OBJECTS) $(checkpdfs_LDADD) $(LIBS)
 
+igmp_querier$(EXEEXT): $(igmp_querier_OBJECTS) $(igmp_querier_DEPENDENCIES) $(EXTRA_igmp_querier_DEPENDENCIES) 
+	@rm -f igmp_querier$(EXEEXT)
+	$(AM_V_CCLD)$(LINK) $(igmp_querier_OBJECTS) $(igmp_querier_LDADD) $(LIBS)
+
 iperf$(EXEEXT): $(iperf_OBJECTS) $(iperf_DEPENDENCIES) $(EXTRA_iperf_DEPENDENCIES) 
 	@rm -f iperf$(EXEEXT)
 	$(AM_V_CXXLD)$(iperf_LINK) $(iperf_OBJECTS) $(iperf_LDADD) $(LIBS)
@@ -474,7 +482,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/gnu_getopt.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/gnu_getopt_long.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/histogram.Po@am__quote@
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioctls.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/igmp_querier.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/isochronous.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/main.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/pdfs.Po@am__quote@

@@ -57,6 +57,18 @@
 #include "Settings.hpp"
 #include "Timestamp.hpp"
 
+
+// Define fatal and nonfatal write errors
+#ifdef WIN32
+#define FATALTCPWRITERR(errno)  ((errno = WSAGetLastError()) != WSAETIMEDOUT)
+#define NONFATALTCPWRITERR(errno) ((errno = WSAGetLastError()) == WSAETIMEDOUT)
+#define FATALUDPWRITERR(errno)  (((errno = WSAGetLastError()) != WSAETIMEDOUT) && (errno != WSAECONNREFUSED))
+#else
+#define FATALTCPWRITERR(errno)  (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+#define NONFATALTCPWRITERR(errno)  (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+#define FATALUDPWRITERR(errno) 	((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR) && (errno != ECONNREFUSED) && (errno != ENOBUFS))
+#endif
+
 /* ------------------------------------------------------------------- */
 class Client {
 public:
@@ -76,7 +88,7 @@ public:
     void InitiateServer();
 
 private:
-    void WritePacketID(void);
+    void WritePacketID( intmax_t );
     void InitTrafficLoop(void);
     void FinishTrafficActions(void);
     void FinalUDPHandshake(void);
@@ -85,7 +97,7 @@ private:
 
     ReportStruct *reportstruct;
     double delay_lower_bounds;
-    max_size_t totLen;
+    intmax_t totLen;
 
     // TCP plain
     void RunTCP( void );
@@ -93,12 +105,10 @@ private:
     void RunRateLimitedTCP( void );
     // UDP traffic with isochronous and vbr support
     void RunUDPIsochronous( void );
-    // UDP traffic with threads synced to transmit at near the same time
-    void RunUDPTxSync( void );
     // UDP plain
     void RunUDP( void );
     // client connect
-    void Connect( );
+    double Connect( );
     void HdrXchange(int flags);
 
     thread_Settings *mSettings;
@@ -107,8 +117,7 @@ private:
     Timestamp lastPacketTime;
     Timestamp now;
     char* readAt;
-    Timestamp syncTime;
-
+    Timestamp connect_done, connect_start;
 }; // end class Client
 
 #endif // CLIENT_H

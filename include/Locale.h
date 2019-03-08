@@ -78,6 +78,8 @@ extern const char server_port[];
 
 extern const char client_port[];
 
+extern const char client_report_epoch_start[];
+
 extern const char server_pid_port[];
 
 extern const char client_pid_port[];
@@ -112,6 +114,7 @@ extern const char wait_server_threads[];
 
 extern const char client_udp_isochronous[];
 
+extern const char client_fq_pacing[];
 /* -------------------------------------------------------------------
  * Legacy reports
  * ------------------------------------------------------------------- */
@@ -146,6 +149,8 @@ extern const char report_bw_read_enhanced_header[];
 extern const char report_bw_read_enhanced_format[];
 
 extern const char report_sum_bw_read_enhanced_format[];
+
+extern const char report_triptime_enhanced_format[];
 
 extern const char report_bw_write_enhanced_header[];
 

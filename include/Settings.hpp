@@ -70,7 +70,11 @@ extern "C" {
 #endif
 
 /* Smallest report interval supported. Units is seconds */
+#ifndef HAVE_FASTSAMPLING
 #define SMALLEST_INTERVAL 0.005
+#else
+#define SMALLEST_INTERVAL 0.0001
+#endif
 
 // server/client mode
 typedef enum ThreadMode {
@@ -143,9 +147,6 @@ typedef struct thread_Settings {
 #if defined(HAVE_LINUX_FILTER_H) && defined(HAVE_AF_PACKET)
     int mSockDrop;
 #endif
-#ifdef HAVE_UDPTRIGGERS
-    int mSockIoctl;
-#endif
     int Extractor_size;
     int mBufLen;                    // -l
     int mMSS;                       // -M
@@ -179,9 +180,9 @@ typedef struct thread_Settings {
     ReportMode mReportMode;
     TestMode mMode;                 // -r or -d
     // Hopefully int64_t's
-    max_size_t mUDPRate;            // -b or -u
+    intmax_t mUDPRate;            // -b or -u
     RateUnits mUDPRateUnits;        // -b is either bw or pps
-    umax_size_t mAmount;             // -n or -t
+    uintmax_t mAmount;             // -n or -t
     // doubles
     double mInterval;               // -i
     // shorts
@@ -204,8 +205,8 @@ typedef struct thread_Settings {
     int mUDPbins;
     int mUDPbinsize;
     unsigned short mUDPunits;
-    unsigned short mUDPci_lower;
-    unsigned short mUDPci_upper;
+    double mUDPci_lower;
+    double mUDPci_upper;
 #if defined( HAVE_WIN32_THREAD )
     HANDLE mHandle;
 #endif
@@ -218,9 +219,12 @@ typedef struct thread_Settings {
     int l4offset; // used in l2 mode to offset the raw packet
     int l4payloadoffset;
     int recvflags; // used to set recv flags,e.g. MSG_TRUNC with L
-    struct timeval thread_synctime;
-    double mTxSyncInterval;
     double mVariance; //vbr variance
+    unsigned int mFQPacingRate;
+    struct timeval txstart_epoch;
+#ifdef HAVE_CLOCK_NANOSLEEP
+    struct timespec txstart;
+#endif
 } thread_Settings;
 
 /*
@@ -271,12 +275,14 @@ typedef struct thread_Settings {
 #define FLAG_SEQNO64        0x00000002
 #define FLAG_REVERSE        0x00000004
 #define FLAG_ISOCHRONOUS    0x00000008
-#define FLAG_UDPTRIGGERS    0x00000010
+#define FLAG_UDPUNUSED      0x00000010
 #define FLAG_UDPHISTOGRAM   0x00000020
 #define FLAG_L2LENGTHCHECK  0x00000100
-#define FLAG_TXSYNC         0x00000200
+#define FLAG_TXSTARTTIME    0x00000200
 #define FLAG_INCRDSTIP      0x00000400
 #define FLAG_VARYLOAD       0x00000800
+#define FLAG_FQPACING       0x00001000
+#define FLAG_TRIPTIME       0x00002000
 
 
 #define isBuflenSet(settings)      ((settings->flags & FLAG_BUFLENSET) != 0)
@@ -313,12 +319,13 @@ typedef struct thread_Settings {
 #define isSeqNo64b(settings)       ((settings->flags_extend & FLAG_SEQNO64) != 0)
 #define isReverse(settings)        ((settings->flags_extend & FLAG_REVERSE) != 0)
 #define isIsochronous(settings)    ((settings->flags_extend & FLAG_ISOCHRONOUS) != 0)
-#define isUDPTriggers(settings)    ((settings->flags_extend & FLAG_UDPTRIGGERS) != 0)
 #define isUDPHistogram(settings)   ((settings->flags_extend & FLAG_UDPHISTOGRAM) != 0)
 #define isL2LengthCheck(settings)  ((settings->flags_extend & FLAG_L2LENGTHCHECK) != 0)
-#define isIncrDstIP(settings)       ((settings->flags_extend & FLAG_INCRDSTIP) != 0)
-#define isTxSync(settings)         ((settings->flags_extend & FLAG_TXSYNC) != 0)
-#define isVaryLoad(settings)         ((settings->flags_extend & FLAG_VARYLOAD) != 0)
+#define isIncrDstIP(settings)      ((settings->flags_extend & FLAG_INCRDSTIP) != 0)
+#define isTxStartTime(settings)         ((settings->flags_extend & FLAG_TXSTARTTIME) != 0)
+#define isVaryLoad(settings)       ((settings->flags_extend & FLAG_VARYLOAD) != 0)
+#define isFQPacing(settings)       ((settings->flags_extend & FLAG_FQPACING) != 0)
+#define isTripTime(settings)       ((settings->flags_extend & FLAG_TRIPTIME) != 0)
 
 #define setBuflenSet(settings)     settings->flags |= FLAG_BUFLENSET
 #define setCompat(settings)        settings->flags |= FLAG_COMPAT
@@ -352,12 +359,13 @@ typedef struct thread_Settings {
 #define setSeqNo64b(settings)      settings->flags_extend |= FLAG_SEQNO64
 #define setReverse(settings)       settings->flags_extend |= FLAG_REVERSE
 #define setIsochronous(settings)   settings->flags_extend |= FLAG_ISOCHRONOUS
-#define setUDPTriggers(settings)   settings->flags_extend |= FLAG_UDPTRIGGERS
 #define setUDPHistogram(settings)  settings->flags_extend |= FLAG_UDPHISTOGRAM
 #define setL2LengthCheck(settings)    settings->flags_extend |= FLAG_L2LENGTHCHECK
 #define setIncrDstIP(settings)     settings->flags_extend |= FLAG_INCRDSTIP
-#define setTxSync(settings)        settings->flags_extend |= FLAG_TXSYNC
+#define setTxStartTime(settings)        settings->flags_extend |= FLAG_TXSTARTTIME
 #define setVaryLoad(settings)      settings->flags_extend |= FLAG_VARYLOAD
+#define setFQPacing(settings)      settings->flags_extend |= FLAG_FQPACING
+#define setTripTime(settings)      settings->flags_extend |= FLAG_TRIPTIME
 
 #define unsetBuflenSet(settings)   settings->flags &= ~FLAG_BUFLENSET
 #define unsetCompat(settings)      settings->flags &= ~FLAG_COMPAT
@@ -391,12 +399,13 @@ typedef struct thread_Settings {
 #define unsetSeqNo64b(settings)    settings->flags_extend &= ~FLAG_SEQNO64
 #define unsetReverse(settings)     settings->flags_extend &= ~FLAG_REVERSE
 #define unsetIsochronous(settings) settings->flags_extend &= ~FLAG_ISOCHRONOUS
-#define unsetUDPTriggers(settings) settings->flags_extend &= ~FLAG_UDPTRIGGERS
 #define unsetUDPHistogram(settings)    settings->flags_extend &= ~FLAG_UDPHISTOGRAM
 #define unsetL2LengthCheck(settings)  settings->flags_extend &= ~FLAG_L2LENGTHCHECK
 #define unsetIncrDstIP(settings)   settings->flags_extend &= ~FLAG_INCRDSTIP
-#define unsetTxSync(settings)      settings->flags_extend &= ~FLAG_TXSYNC
+#define unsetTxStartTime(settings)      settings->flags_extend &= ~FLAG_TXSTARTTIME
 #define unsetVaryLoad(settings)      settings->flags_extend &= ~FLAG_VARYLOAD
+#define unsetFQPacing(settings)     settings->flags_extend &= ~FLAG_FQPACING
+#define unsetTripTime(settings)     settings->flags_extend &= ~FLAG_TRIPTIME
 
 /*
  * Message header flags
@@ -406,13 +415,14 @@ typedef struct thread_Settings {
 #define HEADER_VERSION1 0x80000000
 #define HEADER_EXTEND   0x40000000
 #define HEADER_UDPTESTS 0x20000000
+#define HEADER_TIMESTAMP 0x10000000
+#define HEADER_SEQNO64B  0x08000000
 
 // Below flags are used to pass test settings in *every* UDP packet
 // and not just during the header exchange
 #define HEADER_UDP_ISOCH    0x00000001
 #define HEADER_L2ETHPIPV6   0x00000002
 #define HEADER_L2LENCHECK   0x00000004
-#define HEADER_UDPTRIGGERS  0x00000008
 
 #define RUN_NOW         0x00000001
 // newer flags
@@ -424,9 +434,6 @@ typedef struct thread_Settings {
 // later features
 #define HDRXACKMAX 2500000 // default 2.5 seconds, units microseconds
 #define HDRXACKMIN   10000 // default 10 ms, units microseconds
-#define MAGIC_NUMBER_TYPE 0x100 //
-#define MAGIC_NUMBER_LEN   0x4
-#define MAGIC_DHDHOST_TIMESTAMP 0x18EF0001 // Value used in the UDP payload to trigger the driver to insert DHD host timestamp
 
 /*
  * Structures used for test messages which
@@ -448,32 +455,16 @@ typedef enum MsgType {
 #pragma pack(push,4)
 typedef struct UDP_datagram {
 // used to reference the 4 byte ID number we place in UDP datagrams
-// use int32_t if possible, otherwise a 32 bit bitfield (e.g. on J90)
 // Support 64 bit seqno on machines that support them
-#ifdef HAVE_INT32_T
-    u_int32_t id;
-    u_int32_t tv_sec;
-    u_int32_t tv_usec;
-#else
-    unsigned int id      : 32;
-    unsigned int tv_sec  : 32;
-    unsigned int tv_usec : 32;
-#endif //32
-#ifdef HAVE_INT32_T
-    u_int32_t id2;
-#else
-    unsigned int id2      : 32;
-#endif // 32
+    uint32_t id;
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+    uint32_t id2;
 } UDP_datagram;
 
 typedef struct hdr_typelen {
-#ifdef HAVE_INT32_T
     int32_t type;
     int32_t length;
-#else
-    signed int type     : 32;
-    signed int length    : 32;
-#endif
 } hdr_typelen;
 
 
@@ -485,7 +476,6 @@ typedef struct hdr_typelen {
  * 1.7 has flags, numThreads, mPort, and bufferlen
  */
 typedef struct client_hdr_v1 {
-#ifdef HAVE_INT32_T
     /*
      * flags is a bitmap for different options
      * the most significant bits are for determining
@@ -504,21 +494,12 @@ typedef struct client_hdr_v1 {
     int32_t bufferlen;
     int32_t mWinBand;
     int32_t mAmount;
-#else
-    signed int flags      : 32;
-    signed int numThreads : 32;
-    signed int mPort      : 32;
-    signed int bufferlen  : 32;
-    signed int mWinBand : 32;
-    signed int mAmount    : 32;
-#endif
 } client_hdr_v1;
 
 // This is used for tests that require
 // the initial handshake
 typedef struct client_hdrext {
     hdr_typelen typelen;
-#ifdef HAVE_INT32_T
     int32_t flags;
     int32_t version_u;
     int32_t version_l;
@@ -526,15 +507,6 @@ typedef struct client_hdrext {
     int32_t mRate;
     int32_t mUDPRateUnits;
     int32_t mRealtime;
-#else
-    signed int flags       : 32;
-    signed int version_u   : 32;
-    signed int version_l   : 32;
-    signed int reserved    : 32;
-    signed int mRate      : 32;
-    signed int mUDPRateUnits : 32;
-    signed int mRealtime  : 32;
-#endif
 } client_hdrext;
 
 
@@ -569,57 +541,34 @@ typedef struct client_hdrext {
  *                +--------+--------+--------+--------+
  *            13  |        iperf version minor        |
  *                +--------+--------+--------+--------+
- *            14  |        ref sync sample tv_sec     |
+ *            14  |        isoch burst period (us)    |
  *                +--------+--------+--------+--------+
- *            15  |        ref sync sample tv_used    |
+ *            15  |        isoch start timestamp (s)  |
  *                +--------+--------+--------+--------+
- *            16  |        gps sync sample tv_sec     |
+ *            16  |        isoch start timestamp (us) |
  *                +--------+--------+--------+--------+
- *            17  |        gps sync sample tv_usec    |
+ *            17  |        isoch prev frameid         |
  *                +--------+--------+--------+--------+
- *            18  |        isoch burst period (us)    |
+ *            18  |        isoch frameid              |
  *                +--------+--------+--------+--------+
- *            19  |        isoch start timestamp (s)  |
+ *            19  |        isoch burtsize             |
  *                +--------+--------+--------+--------+
- *            20  |        isoch start timestamp (us) |
+ *            20  |        isoch bytes remaining      |
  *                +--------+--------+--------+--------+
- *            21  |        isoch prev frameid         |
- *                +--------+--------+--------+--------+
- *            22  |        isoch frameid              |
- *                +--------+--------+--------+--------+
- *            23  |        isoch burtsize             |
- *                +--------+--------+--------+--------+
- *            24  |        isoch bytes remaining      |
- *                +--------+--------+--------+--------+
- *            25  |        isoch reserved             |
- *                +--------+--------+--------+--------+
- *            26  |        hw timestamps ...          |
- *                +--------+--------+--------+--------+
- *            n   |        hw timestamps ...
+ *            21  |        isoch reserved             |
  *                +--------+--------+--------+--------+
  *
  */
 
 typedef struct UDP_isoch_payload {
-#ifdef HAVE_INT32_T
-    u_int32_t burstperiod; //period units microseconds
-    u_int32_t start_tv_sec;
-    u_int32_t start_tv_usec;
-    u_int32_t prevframeid;
-    u_int32_t frameid;
-    u_int32_t burstsize;
-    u_int32_t remaining;
-    u_int32_t resevered;
-#else
-    unsigned int burstperiod : 32;
-    unsigned int start_tv_sec : 32;
-    unsigned int start_tv_usec : 32;
-    unsigned int prevframeid : 32;
-    unsigned int frameid : 32;
-    unsigned int burstsize : 32;
-    unsigned int remaining : 32;
-    unsigned int reserved : 32;
-#endif
+    uint32_t burstperiod; //period units microseconds
+    uint32_t start_tv_sec;
+    uint32_t start_tv_usec;
+    uint32_t prevframeid;
+    uint32_t frameid;
+    uint32_t burstsize;
+    uint32_t remaining;
+    uint32_t reserved;
 } UDP_isoch_payload;
 
 // This is used for UDP tests that don't
@@ -627,104 +576,11 @@ typedef struct UDP_isoch_payload {
 typedef struct client_hdr_udp_tests {
 // for 32 bit systems, skip over this field
 // so it remains interoperable with 64 bit peers
-#ifdef HAVE_INT32_T
-    u_int16_t testflags;
-    u_int16_t tlvoffset;
-    u_int32_t version_u;
-    u_int32_t version_l;
-    u_int32_t ref_sync_tv_sec;
-    u_int32_t ref_sync_tv_nsec;
-    u_int32_t gps_sync_tv_sec;
-    u_int32_t gps_sync_tv_nsec;
-#else
-    unsigned short testflags   : 16;
-    unsigned short tlvoffset   : 16;
-    unsigned int version_u   : 32;
-    unsigned int version_l   : 32;
-    unsigned int ref_sync_tv_sec : 32;
-    unsigned int ref_sync_tv_nsec : 32;
-    unsigned int gps_sync_tv_sec : 32;
-    unsigned int gps_sync_tv_nsec : 32;
-#endif
+    int16_t testflags;
+    int16_t tlvoffset;
+    uint32_t version_u;
+    uint32_t version_l;
 } client_hdr_udp_tests;
-
-#ifdef HAVE_UDPTRIGGERS
-/*
- *   UDP FW inline timestamps
- *
- *                 0      7 8     15 16    23 24    31
- *                +--------+--------+--------+--------+
- *            1   |  type (0x100)  |   length (68)    |   length including the 4 bytes tlv
- *                +--------+--------+--------+--------+
- *            2   |             host tx tv sec        |
- *                +--------+--------+--------+--------+
- *            3   |             host tx tv usec       |
- *                +--------+--------+--------+--------+
- *            4   |             host rx tv sec        |
- *                +--------+--------+--------+--------+
- *            5   |             host rx tv usec       |
- *                +--------+--------+--------+--------+
- *            6   |     type (0x1)  |      cnt (2)    |    fw rx tlv
- *                +--------+--------+--------+--------+
- *            7   |        fw rx ts 1 (mac)           |
- *                +--------+--------+--------+--------+
- *            8   |        fw rx ts 2 (pcie)          |
- *                +--------+--------+--------+--------+
- *            9   |     type (0x2)  |      cnt (1)    |    fw tx tlv
- *                +--------+--------+--------+--------+
- *            10  |        seqno lower                |
- *                +--------+--------+--------+--------+
- *            11  |        iperf tv_sec               |
- *                +--------+--------+--------+--------+
- *            12  |        iperf tv_usec              |
- *                +--------+--------+--------+--------+
- *            13  |        seqno upper ??             |
- *                +--------+--------+--------+--------+
- *            14  |        fw tx ts 1  pcie           |
- *                +--------+--------+--------+--------+
- *            15  |        fw tx ts 2  tx dma         |
- *                +--------+--------+--------+--------+
- *            16  |        fw tx ts 3  tx status      |
- *                +--------+--------+--------+--------+
- *            17  |        fw tx ts 4  pcie rt        |
- *                +--------+--------+--------+--------+
- *
- * TSF histograms
- * DHDRX-DHDTX 'DRRx-DRTx;'
- * hs1 = 14,8 T6 "FWR2-FWT1"
- * hs2 = 15,7 T5 "FWR1-FWT2'
- * hs3 = 14,17 T4 'FWT4-FWT1'
- * hs4 = 15,16 T3 'FWT3-FWT2'
- * hs5 = 7,8 T2 'FWR2-FWR1'
- */
-typedef struct fwtsfrx_t {
-    u_int16_t fwtype;
-    u_int16_t fwnct;
-    u_int32_t tsf_rxmac;
-    u_int32_t tsf_rxpcie;
-} fwtsfrx_t;
-
-typedef struct fwtsftx_t {
-    struct UDP_datagram udpid;
-    u_int32_t tsf_txpcie;
-    u_int32_t tsf_txdma;
-    u_int32_t tsf_txstatus;
-    u_int32_t tsf_txpciert;
-} fwtsftx_t;
-
-typedef struct UDPTriggers {
-    u_int16_t type;
-    u_int16_t length;
-    u_int32_t hosttx_tv_sec;
-    u_int32_t hosttx_tv_usec;
-    u_int32_t hostrx_tv_sec;
-    u_int32_t hostrx_tv_usec;
-    struct fwtsfrx_t fwtsf_rx;
-    u_int16_t fwtsf_type;
-    u_int16_t fwtsf_cnt;
-    struct fwtsftx_t fwtsf_tx[];
-} UDPTriggers;
-#endif //UDPTRIGGERS
 
 
 typedef struct client_hdr_udp_isoch_tests {
@@ -734,18 +590,11 @@ typedef struct client_hdr_udp_isoch_tests {
 
 typedef struct client_hdr_ack {
     hdr_typelen typelen;
-#ifdef HAVE_INT32_T
     int32_t flags;
     int32_t version_u;
     int32_t version_l;
-    int32_t reserved;
-#else
-    signed int flags    : 32;
-    signed int version_u   : 32;
-    signed int version_l   : 32;
-    signed int reserved1   : 32;
-    signed int reserved2   : 32;
-#endif
+    int32_t reserved1;
+    int32_t reserved2;
 } client_hdr_ack;
 
 typedef struct client_hdr {
@@ -763,7 +612,6 @@ typedef struct client_hdr {
  * packet.
  */
 typedef struct server_hdr_v1 {
-#ifdef HAVE_INT32_T
     /*
      * flags is a bitmap for different options
      * the most significant bits are for determining
@@ -781,30 +629,11 @@ typedef struct server_hdr_v1 {
     int32_t error_cnt;
     int32_t outorder_cnt;
     int32_t datagrams;
-#ifdef HAVE_SEQNO64b
-    int32_t datagrams2;
-#endif // SEQ
     int32_t jitter1;
     int32_t jitter2;
-#else // Int32
-    signed int flags        : 32;
-    signed int total_len1   : 32;
-    signed int total_len2   : 32;
-    signed int stop_sec     : 32;
-    signed int stop_usec    : 32;
-    signed int error_cnt    : 32;
-    signed int outorder_cnt : 32;
-    signed int datagrams    : 32;
-#ifdef HAVE_SEQNO64b
-    signed int datagrams2   : 32;
-#endif // SEQ
-    signed int jitter1      : 32;
-    signed int jitter2      : 32;
-#endif
 } server_hdr_v1;
 
 typedef struct server_hdr_extension {
-#ifdef HAVE_INT32_T
     int32_t minTransit1;
     int32_t minTransit2;
     int32_t maxTransit1;
@@ -820,28 +649,19 @@ typedef struct server_hdr_extension {
     int32_t cntTransit;
     int32_t IPGcnt;
     int32_t IPGsum;
-#else
-    signed int minTransit1  : 32;
-    signed int minTransit2  : 32;
-    signed int maxTransit1  : 32;
-    signed int maxTransit2  : 32;
-    signed int sumTransit1  : 32;
-    signed int sumTransit2  : 32;
-    signed int meanTransit1  : 32;
-    signed int meanTransit2  : 32;
-    signed int m2Transit1  : 32;
-    signed int m2Transit2  : 32;
-    signed int vdTransit1  : 32;
-    signed int vdTransit2  : 32;
-    signed int cntTransit   : 32;
-    signed int IPGcnt       : 32;
-    signed int IPGsum       : 32;
-#endif
 } server_hdr_extension;
+
+  // Extension for 64bit datagram counts
+typedef struct server_hdr_extension2 {
+    int32_t error_cnt2;
+    int32_t outorder_cnt2;
+    int32_t datagrams2;
+} server_hdr_extension2;
 
 typedef struct server_hdr {
     server_hdr_v1 base;
     server_hdr_extension extend;
+    server_hdr_extension2 extend2;
 } server_hdr;
 
 #pragma pack(pop)

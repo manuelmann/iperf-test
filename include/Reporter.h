@@ -56,9 +56,6 @@
 #include "headers.h"
 #include "Mutex.h"
 #include "histogram.h"
-#ifdef HAVE_UDPTRIGGERS
-#include "ioctls.h"
-#endif
 
 struct thread_Settings;
 struct server_hdr;
@@ -118,6 +115,8 @@ typedef struct WriteStats {
     int lastTCPretry;
     int cwnd;
     int rtt;
+    double meanrtt;
+    int up_to_date;
 } WriteStats;
 
 #ifdef HAVE_ISOCHRONOUS
@@ -126,9 +125,9 @@ typedef struct IsochStats {
     double mMean; //variable bit rate mean
     double mVariance; //vbr variance
     int mJitterBufSize; //Server jitter buffer size, units is frames
-    max_size_t slipcnt;
-    max_size_t framecnt;
-    max_size_t framelostcnt;
+    intmax_t slipcnt;
+    intmax_t framecnt;
+    intmax_t framelostcnt;
     unsigned int mBurstInterval;
     unsigned int mBurstIPG; //IPG of packets within the burst
     int frameID;
@@ -143,69 +142,27 @@ typedef struct IsochStats {
 #define L2LENERR   0x02
 #define L2CSUMERR  0x04
 
+typedef enum WriteErrType {
+    WriteNoErr  = 0,
+    WriteErrAccount,
+    WriteErrFatal,
+    WriteErrNoAccount,
+} WriteErrType;
+
 typedef struct L2Stats {
-    max_size_t cnt;
-    max_size_t unknown;
-    max_size_t udpcsumerr;
-    max_size_t lengtherr;
-    max_size_t tot_cnt;
-    max_size_t tot_unknown;
-    max_size_t tot_udpcsumerr;
-    max_size_t tot_lengtherr;
+    intmax_t cnt;
+    intmax_t unknown;
+    intmax_t udpcsumerr;
+    intmax_t lengtherr;
+    intmax_t tot_cnt;
+    intmax_t tot_unknown;
+    intmax_t tot_udpcsumerr;
+    intmax_t tot_lengtherr;
 } L2Stats;
 
-
-#ifdef HAVE_UDPTRIGGERS
-/*
- *  FW timestamps are broken accross packets, the rx comes first
- *  then the tx
- *
- *
- *                +--------+--------+--------+--------+
- *            7   |        fw rx ts 1 (mac)           |
- *                +--------+--------+--------+--------+
- *            8   |        fw rx ts 2 (pcie)          |
- *                +--------+--------+--------+--------+
- *            9   |     type (0x2)  |      cnt (1)    |    fw tx tlv
- *                +--------+--------+--------+--------+
- *            10  |        seqno lower                |
- *                +--------+--------+--------+--------+
- *            11  |        iperf tv_sec               |
- *                +--------+--------+--------+--------+
- *            12  |        iperf tv_usec              |
- *                +--------+--------+--------+--------+
- *            13  |        seqno upper ??             |
- *                +--------+--------+--------+--------+
- *            14  |        fw tx ts 1 pcie            |
- *                +--------+--------+--------+--------+
- *            15  |        fw tx ts 2 tx dma          |
- *                +--------+--------+--------+--------+
- *            16  |        fw tx ts 3 tx status       |
- *                +--------+--------+--------+--------+
- *            17  |        fw tx ts 4 pcie rt         |
- *                +--------+--------+--------+--------+
- *
- * TSF histograms
- * hs1 = 14,8
- * hs2 = 15,7
- * hs3 = 14,17
- * hs4 = 15,16
- * hs5 = 7,8
- */
-
-typedef struct fwtsf_report_entry_t {
-    u_int32_t tsf_rxmac; // 7
-    u_int32_t tsf_rxpcie; // 8
-    u_int32_t tsf_txpcie; // 14
-    u_int32_t tsf_txdma; // 15
-    u_int32_t tsf_txstatus; // 16
-    u_int32_t tsf_txpciert; // 17
-} fwtsf_report_entry_t;
-#endif
-
 typedef struct ReportStruct {
-    max_size_t packetID;
-    umax_size_t packetLen;
+    intmax_t packetID;
+    uintmax_t packetLen;
     struct timeval packetTime;
     struct timeval sentTime;
     int errwrite;
@@ -216,21 +173,11 @@ typedef struct ReportStruct {
     int expected_l2len;
 #ifdef HAVE_ISOCHRONOUS
     struct timeval isochStartTime;
-    max_size_t prevframeID;
-    max_size_t frameID;
-    max_size_t burstsize;
-    max_size_t burstperiod;
-    max_size_t remaining;
-#endif
-#ifdef HAVE_UDPTRIGGERS
-#define MAXTSFCHAIN 1470/32
-    struct timeval hostTxTime;
-    struct timeval hostRxTime;
-    struct timespec ref_sync;
-    struct timespec gps_sync;
-    bool hashcollision;
-    int tsfcount;
-    struct fwtsf_report_entry_t tsf[MAXTSFCHAIN];
+    intmax_t prevframeID;
+    intmax_t frameID;
+    intmax_t burstsize;
+    intmax_t burstperiod;
+    intmax_t remaining;
 #endif
 } ReportStruct;
 
@@ -253,19 +200,20 @@ typedef struct Transfer_Info {
     void *reserved_delay;
     int transferID;
     int groupID;
-    max_size_t cntError;
-    max_size_t cntOutofOrder;
-    max_size_t cntDatagrams;
-    max_size_t IPGcnt;
+    intmax_t cntError;
+    intmax_t cntOutofOrder;
+    intmax_t cntDatagrams;
+    intmax_t IPGcnt;
     int socket;
     TransitStats transit;
     SendReadStats sock_callstats;
     // Hopefully int64_t's
-    umax_size_t TotalLen;
+    uintmax_t TotalLen;
     double jitter;
     double startTime;
     double endTime;
     double IPGsum;
+    double tripTime;
     // chars
     char   mFormat;                 // -f
     char   mEnhanced;               // -e
@@ -281,29 +229,6 @@ typedef struct Transfer_Info {
     TransitStats frame;
     histogram_t *framelatency_histogram;
 #endif
-#ifdef HAVE_UDPTRIGGERS
-    histogram_t *hostlatency_histogram;
-    histogram_t *h1_histogram;
-    histogram_t *h2_histogram;
-    histogram_t *h3_histogram;
-    histogram_t *h4_histogram;
-    histogram_t *h5_histogram;
-    histogram_t *h6_histogram;
-    /*
-     * u_int32_t tsf_rxmac   7
-     * u_int32_t tsf_rxpcie  8
-     * u_int32_t tsf_txpcie  14
-     * u_int32_t tsf_txdma   15
-     * u_int32_t tsf_txstatus 16
-     * u_int32_t tsf_txpciert  17
-     */
-    struct tsftv_t tsftv_rxpcie;
-    struct tsftv_t tsftv_rxmac;
-    struct tsftv_t tsftv_txpcie;
-    struct tsftv_t tsftv_txpciert;
-    struct tsftv_t tsftv_txdma;
-    struct tsftv_t tsftv_txstatus;
-#endif
 } Transfer_Info;
 
 typedef struct Connection_Info {
@@ -313,6 +238,8 @@ typedef struct Connection_Info {
     Socklen_t size_local;
     char *peerversion;
     int l2mode;
+    double connecttime;
+    struct timeval epochStartTime;
 } Connection_Info;
 
 typedef struct ReporterData {
@@ -323,18 +250,18 @@ typedef struct ReporterData {
 
     // int's
     int type;
-    max_size_t cntError;
-    max_size_t lastError;
-    max_size_t cntOutofOrder;
-    max_size_t lastOutofOrder;
-    max_size_t cntDatagrams;
-    max_size_t lastDatagrams;
-    max_size_t PacketID;
+    intmax_t cntError;
+    intmax_t lastError;
+    intmax_t cntOutofOrder;
+    intmax_t lastOutofOrder;
+    intmax_t cntDatagrams;
+    intmax_t lastDatagrams;
+    intmax_t PacketID;
 
     int mBufLen;                    // -l
     int mMSS;                       // -M
     int mTCPWin;                    // -w
-    max_size_t mUDPRate;            // -b or -u
+    intmax_t mUDPRate;            // -b or -u
     RateUnits mUDPRateUnits;        // -b is either bw or pps
     /*   flags is a BitMask of old bools
         bool   mBufLenSet;              // -l
@@ -355,8 +282,8 @@ typedef struct ReporterData {
     // enums (which should be special int's)
     ThreadMode mThreadMode;         // -s or -c
     ReportMode mode;
-    umax_size_t TotalLen;
-    umax_size_t lastTotal;
+    uintmax_t TotalLen;
+    uintmax_t lastTotal;
     // doubles
     // shorts
     unsigned short mPort;           // -p
@@ -368,10 +295,12 @@ typedef struct ReporterData {
     struct timeval nextTime;
     struct timeval intervalTime;
     struct timeval IPGstart;
+    struct timeval clientStartTime;
 #ifdef HAVE_ISOCHRONOUS
     IsochStats isochstats;
 #endif
     double TxSyncInterval;
+    unsigned int FQPacingRate;
 } ReporterData;
 
 typedef struct MultiHeader {
@@ -400,7 +329,8 @@ typedef void (* report_statistics)( Transfer_Info* );
 typedef void (* report_serverstatistics)( Connection_Info*, Transfer_Info* );
 
 MultiHeader* InitMulti( struct thread_Settings *agent, int inID );
-ReportHeader* InitReport( struct thread_Settings *agent );
+void InitReport( struct thread_Settings *agent );
+void PostFirstReport(struct thread_Settings *mSettings);
 void ReportPacket( ReportHeader *agent, ReportStruct *packet );
 void CloseReport( ReportHeader *agent, ReportStruct *packet );
 void EndReport( ReportHeader *agent );

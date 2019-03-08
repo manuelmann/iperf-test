@@ -62,12 +62,10 @@
 #include "Reporter.h"
 #include "Locale.h"
 #include "delay.h"
+#include "PerfSocket.hpp"
 #include "SocketAddr.h"
 #if defined(HAVE_LINUX_FILTER_H) && defined(HAVE_AF_PACKET)
 #include "checksums.h"
-#endif
-#ifdef HAVE_UDPTRIGGERS
-#include "ioctls.h"
 #endif
 
 /* -------------------------------------------------------------------
@@ -89,12 +87,6 @@ Server::Server( thread_Settings *inSettings ) {
     // initialize buffer, length checking done by the Listener
     mBuf = new char[((mSettings->mBufLen > SIZEOF_MAXHDRMSG) ? mSettings->mBufLen : SIZEOF_MAXHDRMSG)];
     FAIL_errno( mBuf == NULL, "No memory for buffer\n", mSettings );
-#ifdef HAVE_UDPTRIGGERS
-    int ix;
-    for (ix=0; ix < HASHTABLESIZE; ix++) {
-	fwtsf_hashtable[ix].free=1;
-    }
-#endif
     SockAddr_Ifrname(mSettings);
 }
 
@@ -105,26 +97,32 @@ Server::Server( thread_Settings *inSettings ) {
 Server::~Server() {
     if ( mSettings->mSock != INVALID_SOCKET ) {
         int rc = close( mSettings->mSock );
-        WARN_errno( rc == SOCKET_ERROR, "close" );
+        WARN_errno( rc == SOCKET_ERROR, "server close" );
         mSettings->mSock = INVALID_SOCKET;
     }
 
 #if defined(HAVE_LINUX_FILTER_H) && defined(HAVE_AF_PACKET)
     if ( mSettings->mSockDrop != INVALID_SOCKET ) {
 	int rc = close( mSettings->mSockDrop );
-        WARN_errno( rc == SOCKET_ERROR, "close" );
+        WARN_errno( rc == SOCKET_ERROR, "server close drop" );
         mSettings->mSockDrop = INVALID_SOCKET;
     }
-#endif
-#ifdef HAVE_UDPTRIGGERS
-    close_ioctl_sock(mSettings);
 #endif
     DELETE_ARRAY( mBuf );
 }
 
-
-void Server::Sig_Int( int inSigno ) {
+bool Server::InProgress (void) {
+#ifdef HAVE_SETITIMER
+    if (sInterupted)
+	return false;
+#else
+    if (sInterupted ||
+	(isServerModeTime(mSettings) &&  mEndTime.before(reportstruct->packetTime)))
+	return false;
+#endif
+    return true;
 }
+
 /* -------------------------------------------------------------------
  * Receive TCP data from the (connected) socket.
  * Sends termination flag several times at the end.
@@ -132,79 +130,63 @@ void Server::Sig_Int( int inSigno ) {
  * ------------------------------------------------------------------- */
 void Server::RunTCP( void ) {
     long currLen;
-    max_size_t totLen = 0;
-    ReportStruct *reportstruct = NULL;
-    int running;
-    bool mMode_Time = isServerModeTime( mSettings );
+    intmax_t totLen = 0;
+    bool err  = 0;
+
     Timestamp time1, time2;
     double tokens=0.000004;
 
-    reportstruct = new ReportStruct;
-    if ( reportstruct != NULL ) {
-        reportstruct->packetID = 0;
-        mSettings->reporthdr = InitReport( mSettings );
-	running=1;
-	// setup termination variables
-	if ( mMode_Time ) {
-	    mEndTime.setnow();
-	    mEndTime.add( mSettings->mAmount / 100.0 );
+    InitTrafficLoop();
+
+    while (InProgress() && !err) {
+	reportstruct->emptyreport=0;
+	// perform read
+	if (isBWSet(mSettings)) {
+	    time2.setnow();
+	    tokens += time2.subSec(time1) * (mSettings->mUDPRate / 8.0);
+	    time1 = time2;
 	}
-        do {
-	    reportstruct->emptyreport=0;
-	    // perform read
-	    if (isBWSet(mSettings)) {
-		time2.setnow();
-		tokens += time2.subSec(time1) * (mSettings->mUDPRate / 8.0);
-		time1 = time2;
-	    }
-	    if (tokens >= 0.0) {
-		currLen = recv( mSettings->mSock, mBuf, mSettings->mBufLen, 0 );
-		now.setnow();
-		reportstruct->packetTime.tv_sec = now.getSecs();
-		reportstruct->packetTime.tv_usec = now.getUsecs();
-		if (currLen <= 0) {
-		    reportstruct->emptyreport=1;
-		    // End loop on 0 read or socket error
-		    // except for socket read timeout
-		    if (currLen == 0 ||
+	if (tokens >= 0.0) {
+	    currLen = recv( mSettings->mSock, mBuf, mSettings->mBufLen, 0 );
+	    now.setnow();
+	    reportstruct->packetTime.tv_sec = now.getSecs();
+	    reportstruct->packetTime.tv_usec = now.getUsecs();
+	    if (currLen <= 0) {
+		reportstruct->emptyreport=1;
+		// End loop on 0 read or socket error
+		// except for socket read timeout
+		if (currLen == 0 ||
 #ifdef WIN32
-			(WSAGetLastError() != WSAEWOULDBLOCK)
+		    (WSAGetLastError() != WSAEWOULDBLOCK)
 #else
-			(errno != EAGAIN && errno != EWOULDBLOCK)
+		    (errno != EAGAIN && errno != EWOULDBLOCK)
 #endif // WIN32
-			) {
-			running = 0;
-		    }
-		    currLen = 0;
+		    ) {
+		    err = 1;
 		}
-		totLen += currLen;
-		if (isBWSet(mSettings))
-		    tokens -= currLen;
-		reportstruct->packetLen = currLen;
-		if (mMode_Time && mEndTime.before( reportstruct->packetTime)) {
-		    running = 0;
-		}
-		ReportPacket( mSettings->reporthdr, reportstruct );
-	    } else {
-		// Use a 4 usec delay to fill tokens
-		delay_loop(4);
+		currLen = 0;
 	    }
-
-        } while (running);
-
-        // stop timing
-	now.setnow();
-	reportstruct->packetTime.tv_sec = now.getSecs();
-	reportstruct->packetTime.tv_usec = now.getUsecs();
-
-	if(0.0 == mSettings->mInterval) {
-	    reportstruct->packetLen = totLen;
-        }
-	ReportPacket( mSettings->reporthdr, reportstruct );
-        CloseReport( mSettings->reporthdr, reportstruct );
-    } else {
-        FAIL(1, "Out of memory! Closing server thread\n", mSettings);
+	    totLen += currLen;
+	    if (isBWSet(mSettings))
+		tokens -= currLen;
+	    reportstruct->packetLen = currLen;
+	    ReportPacket( mSettings->reporthdr, reportstruct );
+	} else {
+	    // Use a 4 usec delay to fill tokens
+	    delay_loop(4);
+	}
     }
+
+    // stop timing
+    now.setnow();
+    reportstruct->packetTime.tv_sec = now.getSecs();
+    reportstruct->packetTime.tv_usec = now.getUsecs();
+
+    if(0.0 == mSettings->mInterval) {
+	reportstruct->packetLen = totLen;
+    }
+    ReportPacket( mSettings->reporthdr, reportstruct );
+    CloseReport( mSettings->reporthdr, reportstruct );
 
     Mutex_Lock( &clients_mutex );
     Iperf_delete( &(mSettings->peer), &clients );
@@ -235,10 +217,10 @@ void Server::InitTimeStamping (void) {
 }
 
 void Server::InitTrafficLoop (void) {
-    reportstruct = new ReportStruct;
-    reportstruct->emptyreport=0;
+    InitReport(mSettings);
+    PostFirstReport(mSettings);
+    reportstruct = new ReportStruct();
     FAIL(reportstruct == NULL, "Out of memory! Closing server thread\n", mSettings);
-    mSettings->reporthdr = InitReport( mSettings );
     reportstruct->packetID = 0;
     reportstruct->l2len = 0;
     reportstruct->l2errors = 0x0;
@@ -256,7 +238,7 @@ void Server::InitTrafficLoop (void) {
     // divide by two so timeout is 1/2 the interval
     if (mSettings->mInterval) {
 	sorcvtimer = (int) (mSettings->mInterval * 1e6) / 2;
-    } else if (isModeTime(mSettings)) {
+    } else if (isServerModeTime(mSettings)) {
 	sorcvtimer = (mSettings->mAmount * 1000) / 2;
     }
     if (sorcvtimer > 0) {
@@ -270,6 +252,32 @@ void Server::InitTrafficLoop (void) {
 #endif
 	if (setsockopt( mSettings->mSock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0 ) {
 	    WARN_errno( mSettings->mSock == SO_RCVTIMEO, "socket" );
+	}
+    }
+    if (isServerModeTime(mSettings)) {
+#ifdef HAVE_SETITIMER
+        int err;
+        struct itimerval it;
+	memset (&it, 0, sizeof (it));
+	it.it_value.tv_sec = (int) (mSettings->mAmount / 100.0);
+	it.it_value.tv_usec = (int) (10000 * (mSettings->mAmount -
+					      it.it_value.tv_sec * 100.0));
+	err = setitimer( ITIMER_REAL, &it, NULL );
+	FAIL_errno( err != 0, "setitimer", mSettings );
+#else
+        mEndTime.setnow();
+        mEndTime.add( mSettings->mAmount / 100.0 );
+#endif
+    }
+
+    if (isTripTime(mSettings)) {
+	int n, len=3;
+	uint32_t buf[len];
+	if (len && ((n = recvn(mSettings->mSock, (char *)&buf[0], sizeof(buf), MSG_PEEK)) != (int) sizeof(buf))) {
+	    fprintf(stdout,"Warn: socket trip time read error\n");
+	} else {
+	    mSettings->reporthdr->report.clientStartTime.tv_sec = ntohl(buf[1]);
+	    mSettings->reporthdr->report.clientStartTime.tv_usec = ntohl(buf[2]);
 	}
     }
 }
@@ -318,30 +326,34 @@ int Server::ReadWithRxTimestamp (int *readerr) {
     return currLen;
 }
 
-// Returns false if the client has indicated this is the final packet
+// Returns true if the client has indicated this is the final packet
 bool Server::ReadPacketID (void) {
     bool terminate = false;
     struct UDP_datagram* mBuf_UDP  = (struct UDP_datagram*) (mBuf + mSettings->l4payloadoffset);
 
     // terminate when datagram begins with negative index
     // the datagram ID should be correct, just negated
-#if (HAVE_QUAD_SUPPORT || HAVE_INT64_T)
-    if (isSeqNo64b(mSettings)) {
-	reportstruct->packetID = (((max_size_t) (ntohl(mBuf_UDP->id2)) << 32) | ntohl(mBuf_UDP->id));
-	if (reportstruct->packetID & 0x8000000000000000LL) {
-	    reportstruct->packetID = (reportstruct->packetID & 0x7FFFFFFFFFFFFFFFLL);
-	    terminate = true;
-	}
-    } else
-#endif
-      {
-	reportstruct->packetID = ntohl(mBuf_UDP->id);
-	if (reportstruct->packetID & 0x80000000L) {
-	    reportstruct->packetID = (reportstruct->packetID & 0x7FFFFFFFL);
-	    terminate = true;
-	}
-    }
 
+    if (isSeqNo64b(mSettings)) {
+      // New client - Signed PacketID packed into unsigned id2,id
+      reportstruct->packetID = ((uint32_t)ntohl(mBuf_UDP->id)) | ((uintmax_t)(ntohl(mBuf_UDP->id2)) << 32);
+
+#ifdef SHOW_PACKETID
+      printf("id 0x%x, 0x%x -> %" PRIdMAX " (0x%" PRIxMAX ")\n",
+	     ntohl(mBuf_UDP->id), ntohl(mBuf_UDP->id2), reportstruct->packetID, reportstruct->packetID);
+#endif
+    } else {
+      // Old client - Signed PacketID in Signed id
+      reportstruct->packetID = (int32_t)ntohl(mBuf_UDP->id);
+#ifdef SHOW_PACKETID
+      printf("id 0x%x -> %" PRIdMAX " (0x%" PRIxMAX ")\n",
+	     ntohl(mBuf_UDP->id), reportstruct->packetID, reportstruct->packetID);
+#endif
+    }
+    if (reportstruct->packetID < 0) {
+      reportstruct->packetID = - reportstruct->packetID;
+      terminate = true;
+    }
     // read the sent timestamp from the rx packet
     reportstruct->sentTime.tv_sec = ntohl( mBuf_UDP->tv_sec  );
     reportstruct->sentTime.tv_usec = ntohl( mBuf_UDP->tv_usec );
@@ -466,105 +478,44 @@ int Server::L2_quintuple_filter(void) {
     return 0;
 }
 
-void Server::Isoch_processing (void) {
+void Server::Isoch_processing (int rxlen) {
 #ifdef HAVE_ISOCHRONOUS
-    struct client_hdr_udp_isoch_tests *testhdr = (client_hdr_udp_isoch_tests *)(mBuf + sizeof(client_hdr_v1) + sizeof(UDP_datagram));
-    struct UDP_isoch_payload* mBuf_isoch = &(testhdr->isoch);
-    reportstruct->isochStartTime.tv_sec = ntohl(mBuf_isoch->start_tv_sec);
-    reportstruct->isochStartTime.tv_usec = ntohl(mBuf_isoch->start_tv_usec);
-    reportstruct->frameID = ntohl(mBuf_isoch->frameid);
-    reportstruct->prevframeID = ntohl(mBuf_isoch->prevframeid);
-    reportstruct->burstsize = ntohl(mBuf_isoch->burstsize);
-    reportstruct->burstperiod = ntohl(mBuf_isoch->burstperiod);
-    reportstruct->remaining = ntohl(mBuf_isoch->remaining);
-#endif
-}
-
-void Server::UDPTriggers_processing (void) {
-#ifdef HAVE_UDPTRIGGERS
-    struct client_hdr_udp_tests *tlvhdr = (client_hdr_udp_tests *)(mBuf + sizeof(client_hdr_v1) + sizeof(UDP_datagram));
-    int offset = ntohs(tlvhdr->tlvoffset);
-    reportstruct->tsfcount = 0;
-
-    // protect against offets that go over the packet length
-    if ((offset + sizeof(UDP_isoch_payload) + sizeof(client_hdr_v1) + sizeof(UDP_datagram) + sizeof(UDPTriggers)) <= reportstruct->packetLen) {
-	UDPTriggers *trig = (UDPTriggers *) (mBuf + offset);
-	// pull the host/driver tx/rx timestamps from the packet
-	uint16_t type = ntohs(trig->type);
-	uint16_t len = ntohs(trig->length);
-	if (type==0x100 && len) {
-	    int txtsfcnt = ntohs(trig->fwtsf_cnt);
-	    reportstruct->hostTxTime.tv_sec=ntohl(trig->hosttx_tv_sec);
-	    reportstruct->hostTxTime.tv_usec=ntohl(trig->hosttx_tv_usec);
-	    reportstruct->hostRxTime.tv_sec=ntohl(trig->hostrx_tv_sec);
-	    reportstruct->hostRxTime.tv_usec=ntohl(trig->hostrx_tv_usec);
-	    // Grab the TX side sync timestamps here with ntohl
-	    reportstruct->ref_sync.tv_sec = ntohl(tlvhdr->ref_sync_tv_sec);
-	    reportstruct->ref_sync.tv_nsec = ntohl(tlvhdr->ref_sync_tv_nsec);
-	    reportstruct->gps_sync.tv_sec = ntohl(tlvhdr->gps_sync_tv_sec);
-	    reportstruct->gps_sync.tv_nsec = ntohl(tlvhdr->gps_sync_tv_nsec);
-
-	    // Process tx tsf first
-	    int tsfcount = 0;
-	    if (txtsfcnt <= MAXTSFCHAIN) {
-		fwtsftx_t *fwtimes = &trig->fwtsf_tx[0];
-		while (txtsfcnt--) {
-		    int64_t txpacketID = (((int64_t) (ntohl(fwtimes->udpid.id2)) << 32) | ntohl(fwtimes->udpid.id));
-		    int txhash = packetidhash(txpacketID);
-		    if ((!fwtsf_hashtable[txhash].free) && (fwtsf_hashtable[txhash].packetID == txpacketID)) {
-			reportstruct->tsf[tsfcount].tsf_rxmac = fwtsf_hashtable[txhash].fwrxts1;
-			reportstruct->tsf[tsfcount].tsf_rxpcie = fwtsf_hashtable[txhash].fwrxts2;
-			reportstruct->tsf[tsfcount].tsf_txpcie =  ntohl(fwtimes->tsf_txpcie);
-			reportstruct->tsf[tsfcount].tsf_txdma = ntohl(fwtimes->tsf_txdma);
-			reportstruct->tsf[tsfcount].tsf_txstatus = ntohl(fwtimes->tsf_txstatus);
-			reportstruct->tsf[tsfcount].tsf_txpciert = ntohl(fwtimes->tsf_txpciert);
-			fwtsf_hashtable[txhash].free = 1;
-			tsfcount++;
-		    }
-		    fwtimes++;
-		}
-		reportstruct->tsfcount = tsfcount;
-	    }
-	    // Insert rx tsf in hash table
-	    int rxhash = packetidhash(reportstruct->packetID);
-	    if (fwtsf_hashtable[rxhash].free) {
-		reportstruct->hashcollision = 0;
-	    } else {
-		reportstruct->hashcollision = 1;
-	    }
-	    fwtsf_hashtable[rxhash].packetID = reportstruct->packetID;
-	    fwtsf_hashtable[rxhash].fwrxts1 = ntohl(trig->fwtsf_rx.tsf_rxmac);
-	    fwtsf_hashtable[rxhash].fwrxts2 = ntohl(trig->fwtsf_rx.tsf_rxpcie);
-	    fwtsf_hashtable[rxhash].free = 0;
-	}
+    // Ignore runt sized isoch packets
+    if (rxlen < (int) (sizeof(UDP_datagram) +  sizeof(client_hdr_v1) + sizeof(client_hdr_udp_isoch_tests))) {
+	reportstruct->burstsize = 0;
+	reportstruct->remaining = 0;
+	reportstruct->frameID = 0;
+    } else {
+	struct client_hdr_udp_isoch_tests *testhdr = (client_hdr_udp_isoch_tests *)(mBuf + sizeof(client_hdr_v1) + sizeof(UDP_datagram));
+	struct UDP_isoch_payload* mBuf_isoch = &(testhdr->isoch);
+	reportstruct->isochStartTime.tv_sec = ntohl(mBuf_isoch->start_tv_sec);
+	reportstruct->isochStartTime.tv_usec = ntohl(mBuf_isoch->start_tv_usec);
+	reportstruct->frameID = ntohl(mBuf_isoch->frameid);
+	reportstruct->prevframeID = ntohl(mBuf_isoch->prevframeid);
+	reportstruct->burstsize = ntohl(mBuf_isoch->burstsize);
+	reportstruct->burstperiod = ntohl(mBuf_isoch->burstperiod);
+	reportstruct->remaining = ntohl(mBuf_isoch->remaining);
     }
 #endif
 }
+
 /* -------------------------------------------------------------------
  * Receive UDP data from the (connected) socket.
  * Sends termination flag several times at the end.
  * Does not close the socket.
  * ------------------------------------------------------------------- */
 void Server::RunUDP( void ) {
-    int done;
-    bool mMode_Time = isServerModeTime( mSettings );
     int rxlen;
     int readerr = 0;
+    bool lastpacket = 0;
 
     InitTrafficLoop();
-
-    // setup termination variables
-    if ( mMode_Time ) {
-	mEndTime.setnow();
-	mEndTime.add( mSettings->mAmount / 100.0 );
-    }
-    done=0;
 
     // Exit loop on three conditions
     // 1) Fatal read error
     // 2) Last packet of traffic flow sent by client
     // 3) -t timer expires
-    do {
+    while (InProgress() && !readerr && !lastpacket) {
 	// The emptyreport flag can be set
 	// by any of the packet processing routines
 	// If it's set the iperf reporter won't do
@@ -575,9 +526,7 @@ void Server::RunUDP( void ) {
 	// read the next packet with timestamp
 	// will also set empty report or not
 	rxlen=ReadWithRxTimestamp(&readerr);
-	if (readerr) {
-	    done = 1;
-	} else if (rxlen > 0) {
+	if (!readerr && (rxlen > 0)) {
 	    if (isL2LengthCheck(mSettings)) {
 		reportstruct->l2len = rxlen;
 		// L2 processing will set the reportstruct packet length with the length found in the udp header
@@ -592,23 +541,16 @@ void Server::RunUDP( void ) {
 	    if (!(reportstruct->l2errors & L2UNKNOWN)) {
 		// ReadPacketID returns true if this is the last UDP packet sent by the client
 		// aslo sets the packet rx time in the reportstruct
-		done = ReadPacketID();
+		lastpacket = ReadPacketID();
 		if (isIsochronous(mSettings)) {
-		    Isoch_processing();
-		}
-		if (isUDPTriggers(mSettings)) {
-		    UDPTriggers_processing();
+		    Isoch_processing(rxlen);
 		}
 	    }
 	}
 
-	if (mMode_Time && mEndTime.before( reportstruct->packetTime)) {
-	    done = 1;
-	}
-
 	ReportPacket(mSettings->reporthdr, reportstruct);
 
-    } while (!done);
+    }
 
     CloseReport( mSettings->reporthdr, reportstruct );
 
@@ -651,13 +593,15 @@ void Server::write_UDP_AckFIN( ) {
         server_hdr *hdr;
 
         UDP_Hdr = (UDP_datagram*) mBuf;
-
         if (mSettings->mBufLen > (int) (sizeof(UDP_datagram) + sizeof(server_hdr))) {
 	    int flags = (!isEnhanced(mSettings) ? HEADER_VERSION1 : (HEADER_VERSION1 | HEADER_EXTEND));
+#ifdef HAVE_INT64_T
+	    flags |=  HEADER_SEQNO64B;
+#endif
             Transfer_Info *stats = GetReport( mSettings->reporthdr );
             hdr = (server_hdr*) (UDP_Hdr+1);
 	    hdr->base.flags        = htonl((long) flags);
-#ifdef HAVE_QUAD_SUPPORT
+#ifdef HAVE_INT64_T
             hdr->base.total_len1   = htonl( (long) (stats->TotalLen >> 32) );
 #else
             hdr->base.total_len1   = htonl(0x0);
@@ -665,18 +609,15 @@ void Server::write_UDP_AckFIN( ) {
             hdr->base.total_len2   = htonl( (long) (stats->TotalLen & 0xFFFFFFFF) );
             hdr->base.stop_sec     = htonl( (long) stats->endTime );
             hdr->base.stop_usec    = htonl( (long)((stats->endTime - (long)stats->endTime) * rMillion));
-            hdr->base.error_cnt    = htonl( stats->cntError );
-            hdr->base.outorder_cnt = htonl( stats->cntOutofOrder );
-#ifndef HAVE_SEQNO64b
-            hdr->base.datagrams    = htonl( stats->cntDatagrams );
-#else
-  #ifdef HAVE_QUAD_SUPPORT
-	    hdr->base.datagrams2   = htonl( (long) (stats->cntDatagrams >> 32) );
-  #else
-            hdr->base.datagrams2   = htonl(0x0);
-  #endif
-            hdr->base.datagrams    = htonl( (long) (stats->cntDatagrams & 0xFFFFFFFF) );
-#endif
+            hdr->base.error_cnt    = htonl( (long) (stats->cntError & 0xFFFFFFFF) );
+            hdr->base.outorder_cnt = htonl( (long) (stats->cntOutofOrder  & 0xFFFFFFFF));
+	    hdr->base.datagrams    = htonl( (long) (stats->cntDatagrams & 0xFFFFFFFF) );
+	    if (flags & HEADER_SEQNO64B) {
+	      hdr->extend2.error_cnt2    = htonl( (long) ( stats->cntError >> 32) );
+	      hdr->extend2.outorder_cnt2 = htonl( (long) ( stats->cntOutofOrder >> 32)  );
+	      hdr->extend2.datagrams2    = htonl( (long) (stats->cntDatagrams >> 32) );
+	    }
+
             hdr->base.jitter1      = htonl( (long) stats->jitter );
             hdr->base.jitter2      = htonl( (long) ((stats->jitter - (long)stats->jitter) * rMillion) );
 	    if (flags & HEADER_EXTEND) {
@@ -732,19 +673,3 @@ void Server::write_UDP_AckFIN( ) {
     fprintf( stderr, warn_ack_failed, mSettings->mSock, count );
 }
 // end write_UDP_AckFIN
-#ifdef HAVE_UDPTRIGGERS
-/*
- * The iperf 64 bit seq number is a running counter.  For this hash assume the lower bits will be unique most of the time
- * then hash the upper bits to a small space.  The hash table entry isn't expect to live long.
- * Hopefully this will provide low collisions at a relatively low memory cost.
- */
-uint16_t Server::packetidhash (int64_t packetID) {
-    uint64_t m = packetID >> 10;
-    int r = m % 17;
-    if (r == 16) {
-	r = m % 13;
-    }
-    uint16_t hash = (r << 10) | (packetID & 0x3FF);
-    return hash;
-}
-#endif

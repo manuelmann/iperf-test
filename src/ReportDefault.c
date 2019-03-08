@@ -64,18 +64,25 @@
 extern "C" {
 #endif
 
+#define NETPOWERCONSTANT 1e-6
 /*
  * Prints transfer reports in default style
  */
 void reporter_printstats( Transfer_Info *stats ) {
     static char header_printed = 0;
+    double bytesxfered;
 
     byte_snprintf( buffer, sizeof(buffer)/2, (double) stats->TotalLen,
                    toupper( (int)stats->mFormat));
+    if (!stats->TotalLen || (stats->endTime < SMALLEST_INTERVAL)) {
+        bytesxfered = 0;
+    } else {
+        bytesxfered = (double) stats->TotalLen;
+    }
     byte_snprintf( &buffer[sizeof(buffer)/2], sizeof(buffer)/2,
-                   (!stats->TotalLen || (stats->endTime < SMALLEST_INTERVAL)) ?
-		   0 : (stats->TotalLen / (stats->endTime - stats->startTime)),
+                   (bytesxfered / (stats->endTime - stats->startTime)),
 		   stats->mFormat);
+
     // TCP reports
     if (!stats->mUDP) {
 	if (!stats->mEnhanced) {
@@ -104,15 +111,28 @@ void reporter_printstats( Transfer_Info *stats ) {
 		       stats->sock_callstats.read.bins[5],
 		       stats->sock_callstats.read.bins[6],
 		       stats->sock_callstats.read.bins[7]);
+		if (stats->tripTime > 0)
+		    printf(report_triptime_enhanced_format,
+		       stats->transferID, stats->startTime, stats->endTime,
+		       buffer, &buffer[sizeof(buffer)/2],
+		       stats->tripTime);
+
 	    } else {
-		printf(report_bw_write_enhanced_format,
+	        double netpower = 0;
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
+		if (stats->sock_callstats.write.rtt > 0) {
+		  netpower = NETPOWERCONSTANT * (((double) bytesxfered / (double) (stats->endTime - stats->startTime)) / (1e-6 * stats->sock_callstats.write.rtt));
+	        }
+#endif
+	        printf(report_bw_write_enhanced_format,
 		       stats->transferID, stats->startTime, stats->endTime,
 		       buffer, &buffer[sizeof(buffer)/2],
 		       stats->sock_callstats.write.WriteCnt,
 		       stats->sock_callstats.write.WriteErr,
 		       stats->sock_callstats.write.TCPretry,
 		       stats->sock_callstats.write.cwnd,
-		       stats->sock_callstats.write.rtt);
+		       stats->sock_callstats.write.rtt,
+		       netpower);
 	    }
 	}
     } else if ( stats->mUDP == (char)kMode_Client ) {
@@ -172,46 +192,39 @@ void reporter_printstats( Transfer_Info *stats ) {
 		} else {
 #ifdef HAVE_ISOCHRONOUS
 		    if (stats->mIsochronous) {
+			double meantransit = stats->transit.sumTransit / stats->transit.cntTransit;
 			printf( report_bw_jitter_loss_enhanced_isoch_format, stats->transferID,
 				stats->startTime, stats->endTime,
 				buffer, &buffer[sizeof(buffer)/2],
-				stats->jitter*1000.0, stats->cntError, stats->cntDatagrams,
+				stats->jitter*1e3, stats->cntError, stats->cntDatagrams,
 				(100.0 * stats->cntError) / stats->cntDatagrams,
-				(stats->transit.sumTransit / stats->transit.cntTransit)*1000.0,
-				stats->transit.minTransit*1000.0,
-				stats->transit.maxTransit*1000.0,
-				(stats->transit.cntTransit < 2) ? 0 : sqrt(stats->transit.m2Transit / (stats->transit.cntTransit - 1)) / 1000,
-				(stats->IPGcnt / stats->IPGsum), stats->isochstats.framecnt, stats->isochstats.framelostcnt);
+				(meantransit * 1e3),
+				stats->transit.minTransit*1e3,
+				stats->transit.maxTransit*1e3,
+				(stats->transit.cntTransit < 2) ? 0 : sqrt(stats->transit.m2Transit / (stats->transit.cntTransit - 1)) / 1e3,
+				(stats->IPGcnt / stats->IPGsum),
+				((meantransit > 0.0) ? (NETPOWERCONSTANT * ((double) bytesxfered) / (double) (stats->endTime - stats->startTime) / meantransit) : 0),
+				stats->isochstats.framecnt, stats->isochstats.framelostcnt);
 		    } else
 #endif
-
-		    printf( report_bw_jitter_loss_enhanced_format, stats->transferID,
+			{
+			    double meantransit = (stats->transit.sumTransit / stats->transit.cntTransit);
+			    printf( report_bw_jitter_loss_enhanced_format, stats->transferID,
 			    stats->startTime, stats->endTime,
 			    buffer, &buffer[sizeof(buffer)/2],
 			    stats->jitter*1000.0, stats->cntError, stats->cntDatagrams,
 			    (100.0 * stats->cntError) / stats->cntDatagrams,
-			    (stats->transit.sumTransit / stats->transit.cntTransit)*1000.0,
-			    stats->transit.minTransit*1000.0,
-			    stats->transit.maxTransit*1000.0,
-			    (stats->transit.cntTransit < 2) ? 0 : sqrt(stats->transit.m2Transit / (stats->transit.cntTransit - 1)) / 1000,
-			    (stats->IPGcnt / stats->IPGsum));
+			    (meantransit * 1e3),
+			    stats->transit.minTransit*1e3,
+			    stats->transit.maxTransit*1e3,
+			    (stats->transit.cntTransit < 2) ? 0 : sqrt(stats->transit.m2Transit / (stats->transit.cntTransit - 1)) / 1e3,
+			    (stats->IPGcnt / stats->IPGsum),
+			    (meantransit > 0.0) ? (NETPOWERCONSTANT * ((double) bytesxfered) / (double) (stats->endTime - stats->startTime) / meantransit) : 0);
+			}
 		}
 		if (stats->latency_histogram) {
 		    histogram_print(stats->latency_histogram, stats->startTime, stats->endTime,stats->free);
 		}
-#ifdef HAVE_UDPTRIGGERS
-		if (stats->hostlatency_histogram) {
-		    histogram_print(stats->hostlatency_histogram, stats->startTime, stats->endTime,stats->free);
-		}
-		if (stats->h1_histogram) {
-		    histogram_print(stats->h1_histogram,stats->startTime, stats->endTime,stats->free);
-		    histogram_print(stats->h2_histogram,stats->startTime, stats->endTime,stats->free);
-		    histogram_print(stats->h3_histogram,stats->startTime, stats->endTime,stats->free);
-		    histogram_print(stats->h4_histogram,stats->startTime, stats->endTime,stats->free);
-		    histogram_print(stats->h5_histogram,stats->startTime, stats->endTime,stats->free);
-		    histogram_print(stats->h6_histogram,stats->startTime, stats->endTime,stats->free);
-		}
-#endif
 #ifdef HAVE_ISOCHRONOUS
 		if (stats->framelatency_histogram) {
 		    histogram_print(stats->framelatency_histogram, stats->startTime, stats->endTime,stats->free);
@@ -276,24 +289,6 @@ void reporter_printstats( Transfer_Info *stats ) {
 		stats->framelatency_histogram = NULL;
 	    }
 #endif
-#ifdef HAVE_UDPTRIGGERS
-	    if (stats->hostlatency_histogram) {
-		histogram_delete(stats->hostlatency_histogram);
-		stats->hostlatency_histogram = NULL;
-	    }
-	    if (stats->h1_histogram) {
-		histogram_delete(stats->h1_histogram);
-		stats->h1_histogram = NULL;
-		histogram_delete(stats->h2_histogram);
-		stats->h2_histogram = NULL;
-		histogram_delete(stats->h3_histogram);
-		stats->h3_histogram = NULL;
-		histogram_delete(stats->h4_histogram);
-		stats->h4_histogram = NULL;
-		histogram_delete(stats->h5_histogram);
-		stats->h5_histogram = NULL;
-	    }
-#endif
 	}
     }
 }
@@ -307,7 +302,7 @@ void reporter_multistats( Transfer_Info *stats ) {
     byte_snprintf( buffer, sizeof(buffer)/2, (double) stats->TotalLen,
                    toupper( (int)stats->mFormat));
     byte_snprintf( &buffer[sizeof(buffer)/2], sizeof(buffer)/2,
-                   stats->TotalLen / (stats->endTime - stats->startTime),
+                   ((double) stats->TotalLen) / (stats->endTime - stats->startTime),
                    stats->mFormat);
 
     if (!stats->mEnhanced) {
@@ -325,7 +320,15 @@ void reporter_multistats( Transfer_Info *stats ) {
 		    buffer, &buffer[sizeof(buffer)/2]);
 	}
     } else {
-	if (stats->mUDP) {
+	if (stats->mUDP == (char)kMode_Server) {
+            // UDP Reporting
+	    printf( report_sum_bw_pps_enhanced_format,
+		    stats->startTime, stats->endTime,
+		    buffer, &buffer[sizeof(buffer)/2],
+		    stats->cntError, stats->cntDatagrams,
+		    (100.0 * stats->cntError) / stats->cntDatagrams,
+		    (stats->IPGcnt ? (stats->IPGcnt / stats->IPGsum) : 0.0));
+	} else if (stats->mUDP) {
 	    // UDP Enhanced Reporting
 	    printf( report_sum_bw_pps_enhanced_format,
 		    stats->startTime, stats->endTime,
@@ -421,6 +424,9 @@ void reporter_reportsettings( ReporterData *data ) {
 	byte_snprintf(meanbuf, sizeof(meanbuf), data->isochstats.mMean, 'a');
 	byte_snprintf(variancebuf, sizeof(variancebuf), data->isochstats.mVariance, 'a');
 	printf(client_udp_isochronous, data->isochstats.mFPS, meanbuf, variancebuf, (data->isochstats.mBurstInterval/1000.0), (data->isochstats.mBurstIPG/1000.0));
+	if ((data->isochstats.mMean / data->isochstats.mFPS) < ((double) (sizeof(UDP_datagram) + sizeof(client_hdr_v1) + sizeof(struct client_hdr_udp_isoch_tests)))) {
+	    fprintf(stderr, "Warning: Requested mean too small to carry isoch payload, code will auto adjust payload sizes\n");
+	}
 #else
 	fprintf(stderr, "--isochronous not supportted, try --enable-isochronous during config and remake\n");
 #endif
@@ -433,15 +439,11 @@ void reporter_reportsettings( ReporterData *data ) {
 		} else {
 		    delay_target = (1e6 / data->mUDPRate);
 		}
-		if (isTxSync(data)) {
-		    printf(client_datagram_size_tx_sync, data->mBufLen, (data->TxSyncInterval * 1000.0));
-		} else {
 #ifdef HAVE_KALMAN
-		    printf(client_datagram_size_kalman, data->mBufLen, delay_target);
+		printf(client_datagram_size_kalman, data->mBufLen, delay_target);
 #else
-		    printf(client_datagram_size, data->mBufLen, delay_target);
+		printf(client_datagram_size, data->mBufLen, delay_target);
 #endif
-		}
 	    } else {
 		printf(server_datagram_size, data->mBufLen);
 	    }
@@ -457,6 +459,12 @@ void reporter_reportsettings( ReporterData *data ) {
     }
     byte_snprintf( buffer, sizeof(buffer), win,
                    toupper( (int)data->info.mFormat));
+    if (isFQPacing(data) && (data->mThreadMode == kMode_Client)) {
+	char tmpbuf[40];
+	byte_snprintf(tmpbuf, sizeof(tmpbuf), data->FQPacingRate, 'a');
+	tmpbuf[39]='\0';
+        printf(client_fq_pacing,tmpbuf);
+    }
     printf( "%s: %s", (isUDP( data ) ?
                                 udp_buffer_size : tcp_window_size), buffer );
     if ( win_requested == 0 ) {
@@ -475,6 +483,9 @@ void reporter_reportsettings( ReporterData *data ) {
  */
 void *reporter_reportpeer( Connection_Info *stats, int ID ) {
     if ( ID > 0 ) {
+	if (stats->epochStartTime.tv_sec) {
+	    printf(client_report_epoch_start, ID,stats->epochStartTime.tv_sec, stats->epochStartTime.tv_usec);
+	}
         // copy the inet_ntop into temp buffers, to avoid overwriting
         char local_addr[ REPORT_ADDRLEN ];
         char remote_addr[ REPORT_ADDRLEN ];
@@ -482,6 +493,7 @@ void *reporter_reportpeer( Connection_Info *stats, int ID ) {
         struct sockaddr *peer = ((struct sockaddr*)&stats->peer);
 
 	char extbuf[2*PEERBUFSIZE];
+	extbuf[(2*PEERBUFSIZE)-1] = '\0';
 	char *b = &extbuf[0];
 	extbuf[0]= '\0';
 	if (stats->l2mode) {
@@ -489,9 +501,12 @@ void *reporter_reportpeer( Connection_Info *stats, int ID ) {
 	    b += strlen(b);
 	}
 	if (stats->peerversion) {
-	    snprintf(b, PEERBUFSIZE, "%s", stats->peerversion);
+	    snprintf(b, PEERBUFSIZE-strlen(b), "%s", stats->peerversion);
+	    b += strlen(b);
 	}
-
+	if (stats->connecttime > 0) {
+	    snprintf(b, PEERBUFSIZE-strlen(b), " (ct=%4.2f ms)", stats->connecttime);;
+	}
         if ( local->sa_family == AF_INET ) {
             inet_ntop( AF_INET, &((struct sockaddr_in*)local)->sin_addr,
                        local_addr, REPORT_ADDRLEN);
@@ -562,10 +577,6 @@ void reporter_peerversion (thread_Settings *inSettings, int upper, int lower) {
 	break;
     default:
 	sprintf(inSettings->peerversion + strlen(inSettings->peerversion) - 1, "-unk)");
-    }
-    if (isUDPTriggers(inSettings)) {
-	int len=strlen(inSettings->peerversion);
-	snprintf(&inSettings->peerversion[len], PEERBUFSIZE, " (%s)", "triggers");
     }
 }
 /* -------------------------------------------------------------------

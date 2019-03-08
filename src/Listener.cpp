@@ -73,6 +73,7 @@
 
 #define HEADERS()
 
+#include <limits.h>
 #include "headers.h"
 #include "Listener.hpp"
 #include "SocketAddr.h"
@@ -83,7 +84,7 @@
 #include "Locale.h"
 #include "SocketAddr.h"
 
-#ifdef HAVE_SSM_MULTICAST
+#if (defined HAVE_SSM_MULTICAST) && (defined HAVE_NET_IF_H)
 #include <net/if.h>
 #endif
 /* -------------------------------------------------------------------
@@ -134,7 +135,7 @@ Listener::Listener( thread_Settings *inSettings ) {
 Listener::~Listener() {
     if ( mSettings->mSock != INVALID_SOCKET ) {
         int rc = close( mSettings->mSock );
-        WARN_errno( rc == SOCKET_ERROR, "close" );
+        WARN_errno( rc == SOCKET_ERROR, "listener close" );
         mSettings->mSock = INVALID_SOCKET;
     }
     DELETE_ARRAY( mBuf );
@@ -234,8 +235,7 @@ sInterupted == SIGALRM
             }
             // Check for exchange of test information and also determine v2.0.5 vs 2.0.10+
             if ( !isCompat( mSettings )) {
-		int flags;
-                if ((flags = ReadClientHeader(hdr)) < 0) {
+                if (ReadClientHeader(hdr) < 0) {
 		    close( server->mSock );
 		    continue;
 		}
@@ -388,9 +388,9 @@ void Listener::Listen( ) {
 	    FAIL_errno( rc == SOCKET_ERROR, "bind", mSettings );
 	}
     // listen for connections (TCP only).
-    // default backlog traditionally 5
+    // use large (INT_MAX) backlog allowing multiple simultaneous connections
     if ( !isUDP( mSettings ) ) {
-	rc = listen( mSettings->mSock, 5 );
+	rc = listen( mSettings->mSock, INT_MAX );
 	WARN_errno( rc == SOCKET_ERROR, "listen" );
     }
 
@@ -484,6 +484,7 @@ void Listener::McastJoin( ) {
 	int iface=0;
 	int rc;
 
+#ifdef HAVE_NET_IF_H
 	/* Set the interface or any */
 	if (mSettings->mIfrname) {
 	    iface = if_nametoindex(mSettings->mIfrname);
@@ -491,6 +492,7 @@ void Listener::McastJoin( ) {
 	} else {
 	    iface = 0;
 	}
+#endif
 
         if (isIPV6(mSettings)) {
 #ifdef HAVE_IPV6_MULTICAST
@@ -498,6 +500,8 @@ void Listener::McastJoin( ) {
 		struct group_source_req group_source_req;
 		struct sockaddr_in6 *group;
 		struct sockaddr_in6 *source;
+
+		memset(&group_source_req, 0, sizeof(struct group_source_req));
 
 		group_source_req.gsr_interface = iface;
 		group=(struct sockaddr_in6*)&group_source_req.gsr_group;
@@ -513,15 +517,20 @@ void Listener::McastJoin( ) {
 		rc=inet_pton(AF_INET6, mSettings->mSSMMulticastStr,&source->sin6_addr);
 		FAIL_errno( rc != 1, "mcast v6 join source group pton",mSettings );
 		source->sin6_port = 0;    /* Ignored */
-#ifdef HAVE_STRUCT_SOCKADDR_IN_SIN_LEN
-		source->sin_len = group->sin_len;
+#ifdef HAVE_STRUCT_SOCKADDR_IN6_SIN6_LEN
+		source->sin6_len = group->sin6_len;
 #endif
+		rc = -1;
+#if HAVE_DECL_MCAST_JOIN_SOURCE_GROUP
 		rc = setsockopt(mSettings->mSock,IPPROTO_IPV6,MCAST_JOIN_SOURCE_GROUP, &group_source_req,
 			    sizeof(group_source_req));
+#endif
 		FAIL_errno( rc == SOCKET_ERROR, "mcast v6 join source group",mSettings);
 	    } else {
 		struct group_req group_req;
 		struct sockaddr_in6 *group;
+
+		memset(&group_req, 0, sizeof(struct group_req));
 
 		group_req.gr_interface = iface;
 		group=(struct sockaddr_in6*)&group_req.gr_group;
@@ -530,8 +539,11 @@ void Listener::McastJoin( ) {
 		rc=getsockname(mSettings->mSock,(struct sockaddr *)group, &socklen);
 		FAIL_errno( rc == SOCKET_ERROR, "mcast v6 join group getsockname",mSettings );
 		group->sin6_port = 0;    /* Ignored */
+		rc = -1;
+#if HAVE_DECL_MCAST_JOIN_GROUP
 		rc = setsockopt(mSettings->mSock,IPPROTO_IPV6,MCAST_JOIN_GROUP, &group_req,
 				sizeof(group_source_req));
+#endif
 		FAIL_errno( rc == SOCKET_ERROR, "mcast v6 join group",mSettings);
 	    }
 #else
@@ -539,13 +551,27 @@ void Listener::McastJoin( ) {
 #endif
 	} else {
 	    if (mSettings->mSSMMulticastStr) {
-		struct group_source_req group_source_req;
 		struct sockaddr_in *group;
-
 		struct sockaddr_in *source;
+
+		// Fill out both structures because we don't which one will succeed
+		// and both may need to be tried
+#ifdef HAVE_STRUCT_IP_MREQ_SOURCE
+		struct ip_mreq_source imr;
+		memset (&imr, 0, sizeof (imr));
+#endif
+#ifdef HAVE_STRUCT_GROUP_SOURCE_REQ
+		struct group_source_req group_source_req;
+		memset(&group_source_req, 0, sizeof(struct group_source_req));
 		group_source_req.gsr_interface = iface;
 		group=(struct sockaddr_in*)&group_source_req.gsr_group;
 		source=(struct sockaddr_in*)&group_source_req.gsr_source;
+#else
+		struct sockaddr_in imrgroup;
+		struct sockaddr_in imrsource;
+		group = &imrgroup;
+		source = &imrsource;
+#endif
 		source->sin_family = AF_INET;
 		group->sin_family = AF_INET;
 		/* Set the group */
@@ -560,12 +586,36 @@ void Listener::McastJoin( ) {
 		source->sin_len = group->sin_len;
 #endif
 		source->sin_port = 0;    /* Ignored */
+		rc = -1;
+
+#if HAVE_DECL_MCAST_JOIN_SOURCE_GROUP
 		rc = setsockopt(mSettings->mSock,IPPROTO_IP,MCAST_JOIN_SOURCE_GROUP, &group_source_req,
 				sizeof(group_source_req));
+#endif
+
+#if HAVE_DECL_IP_ADD_SOURCE_MEMBERSHIP
+#ifdef HAVE_STRUCT_IP_MREQ_SOURCE
+		// Some operating systems will have MCAST_JOIN_SOURCE_GROUP but still fail
+		// In those cases try the IP_ADD_SOURCE_MEMBERSHIP
+		if (rc < 0) {
+#ifdef HAVE_STRUCT_IP_MREQ_SOURCE_IMR_MULTIADDR_S_ADDR
+		    imr.imr_multiaddr = ((const struct sockaddr_in *)group)->sin_addr;
+		    imr.imr_sourceaddr = ((const struct sockaddr_in *)source)->sin_addr;
+#else
+		    // Some Android versions declare mreq_source without an s_addr
+		    imr.imr_multiaddr = ((const struct sockaddr_in *)group)->sin_addr.s_addr;
+		    imr.imr_sourceaddr = ((const struct sockaddr_in *)source)->sin_addr.s_addr;
+#endif
+		    rc = setsockopt (mSettings->mSock, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, (char*)(&imr), sizeof (imr));
+		}
+#endif
+#endif
 		FAIL_errno( rc == SOCKET_ERROR, "mcast join source group",mSettings);
 	    } else {
 		struct group_req group_req;
 		struct sockaddr_in *group;
+
+		memset(&group_req, 0, sizeof(struct group_req));
 
 		group_req.gr_interface = iface;
 		group=(struct sockaddr_in*)&group_req.gr_group;
@@ -574,8 +624,11 @@ void Listener::McastJoin( ) {
 		rc=getsockname(mSettings->mSock,(struct sockaddr *)group, &socklen);
 		FAIL_errno( rc == SOCKET_ERROR, "mcast join group getsockname",mSettings );
 		group->sin_port = 0;    /* Ignored */
+		rc = -1;
+#if HAVE_DECL_MCAST_JOIN_GROUP
 		rc = setsockopt(mSettings->mSock,IPPROTO_IP,MCAST_JOIN_GROUP, &group_req,
 				sizeof(group_source_req));
+#endif
 		FAIL_errno( rc == SOCKET_ERROR, "mcast join group",mSettings);
 	    }
 	}
@@ -671,6 +724,7 @@ int Listener::L2_setup (void) {
     // Now optimize packet flow up the raw socket
     // Establish the flow BPF to forward up only "connected" packets to this raw socket
     if (l->sa_family == AF_INET6) {
+#ifdef HAVE_IPV6
 	struct in6_addr *v6peer = SockAddr_get_in6_addr(&server->peer);
 	struct in6_addr *v6local = SockAddr_get_in6_addr(&server->local);
 	if (isIPV6(server)) {
@@ -681,6 +735,10 @@ int Listener::L2_setup (void) {
 	    rc = SockAddr_v4_Connect_BPF(server->mSock, (uint32_t) v6local->s6_addr32[3], (uint32_t) v6peer->s6_addr32[3], ((struct sockaddr_in6 *)(l))->sin6_port, ((struct sockaddr_in6 *)(p))->sin6_port);
 	    WARN_errno( rc == SOCKET_ERROR, "l2 v4in6 connect ip bpf");
 	}
+#else
+	fprintf(stderr, "Unfortunately, IPv6 is not supported on this platform\n");
+	return -1;
+#endif /* HAVE_IPV6 */
     } else {
 	rc = SockAddr_v4_Connect_BPF(server->mSock, ((struct sockaddr_in *)(l))->sin_addr.s_addr, ((struct sockaddr_in *)(p))->sin_addr.s_addr, ((struct sockaddr_in *)(l))->sin_port, ((struct sockaddr_in *)(p))->sin_port);
 	WARN_errno( rc == SOCKET_ERROR, "l2 connect ip bpf");
@@ -767,30 +825,33 @@ void Listener::Accept( thread_Settings *server ) {
 	    rc = recvfrom( mSettings->mSock, mBuf, mSettings->mBufLen, 0,
 			       (struct sockaddr*) &server->peer, &server->size_peer );
 	    FAIL_errno( rc == SOCKET_ERROR, "recvfrom", mSettings );
-	    Mutex_Lock( &clients_mutex );
-
-	    // Handle connection for UDP sockets.
-	    exist = Iperf_present( &server->peer, clients);
-	    if ( exist == NULL ) {
-		// We have a new UDP flow so let's start the
-		// process to handle it and in a new server thread (yet to be created)
-		server->mSock = mSettings->mSock;
-		// This connect() will allow the OS to only
-		// send packets with the ip quintuple up to the server
-		// socket and, hence, to the server thread (yet to be created)
-		// This connect() routing is only supported with AF_INET or AF_INET6 sockets,
-		// e.g. AF_PACKET sockets can't do this.  We'll handle packet sockets later
-		// All UDP accepts here will use AF_INET.  This is intentional and needed
-		int rc = connect( server->mSock, (struct sockaddr*) &server->peer,
-				  server->size_peer );
-		FAIL_errno( rc == SOCKET_ERROR, "connect UDP", mSettings );
-	    } else {
-		// This isn't a new flow so just ignore the packet
-		// and continue with the while loop
-		// printf("Debug: drop packet on sock %d\n",mSettings->mSock);
+	    if (sInterupted != 0) {
 		server->mSock = INVALID_SOCKET;
+	    } else {
+		Mutex_Lock( &clients_mutex );
+		// Handle connection for UDP sockets.
+		exist = Iperf_present( &server->peer, clients);
+		if ( exist == NULL ) {
+		    // We have a new UDP flow so let's start the
+		    // process to handle it and in a new server thread (yet to be created)
+		    server->mSock = mSettings->mSock;
+		    // This connect() will allow the OS to only
+		    // send packets with the ip quintuple up to the server
+		    // socket and, hence, to the server thread (yet to be created)
+		    // This connect() routing is only supported with AF_INET or AF_INET6 sockets,
+		    // e.g. AF_PACKET sockets can't do this.  We'll handle packet sockets later
+		    // All UDP accepts here will use AF_INET.  This is intentional and needed
+		    int rc = connect( server->mSock, (struct sockaddr*) &server->peer,
+				      server->size_peer );
+		    FAIL_errno( rc == SOCKET_ERROR, "connect UDP", mSettings );
+		} else {
+		    // This isn't a new flow so just ignore the packet
+		    // and continue with the while loop
+		    // printf("Debug: drop packet on sock %d\n",mSettings->mSock);
+		    server->mSock = INVALID_SOCKET;
+		}
+		Mutex_Unlock( &clients_mutex );
 	    }
-	    Mutex_Unlock( &clients_mutex );
 	} else {
 	    // accept a TCP  connection
 	    server->mSock = accept( mSettings->mSock,  (sockaddr*) &server->peer, &server->size_peer );
@@ -823,7 +884,8 @@ void Listener::UDPSingleServer( ) {
     int32_t datagramID;
     client_hdr* hdr = ( UDP ? (client_hdr*) (((UDP_datagram*)mBuf) + 1) :
                               (client_hdr*) mBuf);
-    ReportStruct *reportstruct = new ReportStruct;
+    ReportStruct *reportstruct = new ReportStruct();
+    FAIL_errno( reportstruct == NULL, "No memory for report structure\n", mSettings );
     bool mMode_Time = isServerModeTime( mSettings ) && !isDaemon( mSettings );
     // setup termination variables
     if ( mMode_Time ) {
@@ -924,7 +986,7 @@ void Listener::UDPSingleServer( ) {
                         hdr = (server_hdr*) (UDP_Hdr+1);
 
                         hdr->base.flags        = htonl( HEADER_VERSION1 );
-#ifdef HAVE_QUAD_SUPPORT
+#ifdef HAVE_INT64_T
 			hdr->base.total_len1   = htonl( (long) (stats->TotalLen >> 32) );
 #else
 			hdr->base.total_len1   = htonl(0x0);
@@ -1033,7 +1095,8 @@ void Listener::UDPSingleServer( ) {
                 server->runNext =  tempSettings;
             }
         }
-        server->reporthdr = InitReport( server );
+        InitReport(server);
+        PostFirstReport(server);
 
         // Prep for next connection
         if ( !isSingleClient( mSettings ) ) {
@@ -1048,10 +1111,13 @@ void Listener::UDPSingleServer( ) {
 }
 
 int Listener::ReadClientHeader(client_hdr *hdr ) {
-    int flags = 0;
+    uint32_t flags = 0;
     int testflags = 0;
     if (isUDP(mSettings)) {
 	flags = ntohl(hdr->base.flags);
+	if (flags & HEADER_SEQNO64B) {
+	  setSeqNo64b(server);
+	}
 	if ((flags & HEADER_UDPTESTS) != 0) {
 	    testflags = ntohs(hdr->udp.testflags);
 	    // Handle stateless flags
@@ -1068,12 +1134,6 @@ int Listener::ReadClientHeader(client_hdr *hdr ) {
 	    if ((testflags & HEADER_L2LENCHECK) != 0) {
 		setL2LengthCheck(server);
 	    }
-#ifdef HAVE_UDPTRIGGERS
-	    if ((testflags & HEADER_UDPTRIGGERS) != 0) {
-		setUDPTriggers(server);
-		setSeqNo64b(server);
-	    }
-#endif
 	    reporter_peerversion(server, ntohl(hdr->udp.version_u), ntohl(hdr->udp.version_l));
 	}
     } else {
@@ -1113,9 +1173,10 @@ int Listener::ReadClientHeader(client_hdr *hdr ) {
 		len = sizeof(client_hdr);
 	    } else if ((flags & HEADER_VERSION1) != 0) {
 		len = sizeof(client_hdr_v1);
+	    } else if ((flags & HEADER_TIMESTAMP) != 0 ) {
+		setTripTime(server);
 	    }
 	    if (len && ((n = recvn(server->mSock, p, len, MSG_PEEK)) != len)) {
-		flags = 0;
 		return -1;
 	    }
 	}
@@ -1128,7 +1189,7 @@ int Listener::ReadClientHeader(client_hdr *hdr ) {
 	    ClientHeaderAck();
 	}
     }
-    return(flags);
+    return 0;
 }
 
 int Listener::ClientHeaderAck(void) {

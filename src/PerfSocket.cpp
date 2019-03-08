@@ -144,7 +144,14 @@ void SetSocketOptions( thread_Settings *inSettings ) {
     }
 
 #ifdef IP_TOS
-
+#if HAVE_DECL_IPV6_TCLASS && ! defined HAVE_WINSOCK2_H
+    // IPV6_TCLASS is defined on Windows but not implemented.
+    if (isIPV6(inSettings)) {
+	const int dscp = inSettings->mTOS;
+	int rc = setsockopt(inSettings->mSock, IPPROTO_IPV6, IPV6_TCLASS, (char*) &dscp, sizeof(dscp));
+        WARN_errno( rc == SOCKET_ERROR, "setsockopt IPV6_TCLASS" );
+    } else
+#endif
     // set IP TOS (type-of-service) field
     if ( inSettings->mTOS > 0 ) {
         int  tos = inSettings->mTOS;
@@ -171,6 +178,14 @@ void SetSocketOptions( thread_Settings *inSettings ) {
         }
 #endif
     }
+
+#if HAVE_DECL_SO_MAX_PACING_RATE
+    /* If socket pacing is specified try to enable it. */
+    if (isFQPacing(inSettings) && inSettings->mFQPacingRate > 0) {
+	int rc = setsockopt(inSettings->mSock, SOL_SOCKET, SO_MAX_PACING_RATE, &inSettings->mFQPacingRate, sizeof(inSettings->mFQPacingRate));
+        WARN_errno( rc == SOCKET_ERROR, "setsockopt SO_MAX_PACING_RATE" );
+    }
+#endif /* HAVE_SO_MAX_PACING_RATE */
 }
 
 void SetSocketOptionsSendTimeout( thread_Settings *mSettings, int timer) {

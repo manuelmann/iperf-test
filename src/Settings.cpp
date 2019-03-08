@@ -62,7 +62,6 @@
 #define HEADERS()
 
 #include "headers.h"
-
 #include "Settings.hpp"
 #include "Locale.h"
 #include "SocketAddr.h"
@@ -73,19 +72,14 @@
 #include "isochronous.hpp"
 #include "pdfs.h"
 #endif
-#ifdef HAVE_UDPTRIGGERS
-#include "ioctls.h"
-#endif
 
-static int seqno64b = 0;
 static int reversetest = 0;
 static int udphistogram = 0;
 static int l2checks = 0;
 static int incrdstip = 0;
-static int txsync = 0;
-#ifdef HAVE_UDPTRIGGERS
-static int udptriggers = 0;
-#endif
+static int txstarttime = 0;
+static int fqrate = 0;
+static int triptime = 0;
 #ifdef HAVE_ISOCHRONOUS
 static int burstipg = 0;
 static int burstipg_set = 0;
@@ -153,14 +147,12 @@ const struct option long_options[] =
 {"suggest_win_size", no_argument, NULL, 'W'},
 {"peer-detect",      no_argument, NULL, 'X'},
 {"linux-congestion", required_argument, NULL, 'Z'},
-{"udp-counters-64bit", no_argument, &seqno64b, 1},
 {"udp-histogram", optional_argument, &udphistogram, 1},
 {"l2checks", no_argument, &l2checks, 1},
 {"incr-dstip", no_argument, &incrdstip, 1},
-{"tx-sync", required_argument, &txsync, 1},
-#ifdef HAVE_UDPTRIGGERS
-{"udp-triggers", no_argument, &udptriggers, 1},
-#endif
+{"txstart-time", required_argument, &txstarttime, 1},
+{"fq-rate", required_argument, &fqrate, 1},
+{"trip-time", no_argument, &triptime, 1},
 #ifdef HAVE_ISOCHRONOUS
 {"ipg", required_argument, &burstipg, 1},
 {"isochronous", optional_argument, &isochronous, 1},
@@ -342,7 +334,7 @@ void Settings_Destroy( thread_Settings *mSettings) {
     DELETE_ARRAY( mSettings->mOutputFileName );
     DELETE_ARRAY( mSettings->mUDPHistogramStr );
     DELETE_ARRAY( mSettings->mSSMMulticastStr);
-    DELETE_ARRAY( mSettings->mIfrname);
+    FREE_ARRAY( mSettings->mIfrname);
 #ifdef HAVE_ISOCHRONOUS
     DELETE_ARRAY( mSettings->mIsochronousStr );
 #endif
@@ -463,10 +455,12 @@ void Settings_Interpret( char option, const char *optarg, thread_Settings *mExtS
 	    if (*end != '\0') {
 		fprintf (stderr, "Invalid value of '%s' for -i interval\n", optarg);
 	    } else {
-		if ( mExtSettings->mInterval < SMALLEST_INTERVAL ) {
-		    fprintf (stderr, report_interval_small, mExtSettings->mInterval);
+	        if ( mExtSettings->mInterval < SMALLEST_INTERVAL ) {
 		    mExtSettings->mInterval = SMALLEST_INTERVAL;
-		}
+#ifndef HAVE_FASTSAMPLING
+		    fprintf (stderr, report_interval_small, mExtSettings->mInterval);
+#endif
+	        }
 		if ( mExtSettings->mInterval < 0.5 ) {
 		    setEnhanced( mExtSettings );
 		}
@@ -729,26 +723,51 @@ void Settings_Interpret( char option, const char *optarg, thread_Settings *mExtS
 	    break;
 
         case 0:
-	    if (seqno64b) {
-		seqno64b = 0;
-#if (HAVE_SEQNO64b && (HAVE_QUAD_SUPPORT || HAVE_INT64_T))
-		setSeqNo64b(mExtSettings);
-#else
-		fprintf( stderr, "WARNING: 64 bit sequence numbers not supported\n");
-#endif
-	    }
 	    if (incrdstip) {
 		incrdstip = 0;
 		setIncrDstIP(mExtSettings);
 	    }
-	    if (txsync) {
-		txsync = 0;
-		setTxSync(mExtSettings);
-		char *end;
-		mExtSettings->mTxSyncInterval = strtof(optarg,&end);
-		if (*end != '\0') {
-		    fprintf (stderr, "Invalid value of '%s' for --tx-sync\n", optarg);
+	    if (txstarttime) {
+#ifdef HAVE_CLOCK_NANOSLEEP
+		long seconds;
+		int match = 0;
+		char f0 = '0';
+		char f1 = '0';
+		char f2 = '0';
+		char f3 = '0';
+		char f4 = '0';
+		char f5 = '0';
+		char f6 = '0';
+		char f7 = '0';
+		char f8 = '0';
+		txstarttime = 0;
+		setTxStartTime(mExtSettings);
+		match = sscanf(optarg,"%ld.%c%c%c%c%c%c%c%c%c", &seconds, &f0,&f1,&f2,&f3,&f4,&f5,&f6,&f7,&f8);
+		if (match > 1) {
+		    int i;
+		    mExtSettings->txstart.tv_sec = seconds;
+		    i = f0 - '0'; mExtSettings->txstart.tv_nsec  = i * 100000000;
+		    i = f1 - '0'; mExtSettings->txstart.tv_nsec += i * 10000000;
+		    i = f2 - '0'; mExtSettings->txstart.tv_nsec += i * 1000000;
+		    i = f3 - '0'; mExtSettings->txstart.tv_nsec += i * 100000;
+		    i = f4 - '0'; mExtSettings->txstart.tv_nsec += i * 10000;
+		    i = f5 - '0'; mExtSettings->txstart.tv_nsec += i * 1000;
+		    i = f6 - '0'; mExtSettings->txstart.tv_nsec += i * 100;
+		    i = f7 - '0'; mExtSettings->txstart.tv_nsec += i * 10;
+		    i = f8 - '0'; mExtSettings->txstart.tv_nsec += i;
+		} else if (match == 1) {
+		    mExtSettings->txstart.tv_sec = seconds;
+		    mExtSettings->txstart.tv_nsec = 0;
+		} else {
+		    fprintf(stderr, "WARNING: invalid --txstart-time format\n");
 		}
+#else
+	        fprintf(stderr, "WARNING: --txstart-time not supported\n");
+#endif
+	    }
+	    if (triptime) {
+		triptime = 0;
+		setTripTime(mExtSettings);
 	    }
 	    if (udphistogram) {
 		udphistogram = 0;
@@ -771,6 +790,16 @@ void Settings_Interpret( char option, const char *optarg, thread_Settings *mExtS
 		exit(1);
 		setReverse(mExtSettings);
 	    }
+	    if (fqrate) {
+#if defined(HAVE_DECL_SO_MAX_PACING_RATE)
+	        fqrate=0;
+		setFQPacing(mExtSettings);
+		mExtSettings->mFQPacingRate = (unsigned int) (bitorbyte_atoi(optarg) / 8);
+#else
+		fprintf( stderr, "WARNING: The --fq-rate option is not supported\n");
+#endif
+	    }
+
 #ifdef HAVE_ISOCHRONOUS
 	    if (isochronous) {
 		isochronous = 0;
@@ -795,14 +824,6 @@ void Settings_Interpret( char option, const char *optarg, thread_Settings *mExtS
 		if (*end != '\0') {
 		    fprintf (stderr, "Invalid value of '%s' for --ipg\n", optarg);
 		}
-	    }
-#endif
-#ifdef HAVE_UDPTRIGGERS
-	    if (udptriggers) {
-		udptriggers = 0;
-		setUDP( mExtSettings );
-		setUDPTriggers(mExtSettings);
-		setSeqNo64b(mExtSettings);  // enable this if udp triggers
 	    }
 #endif
 	    break;
@@ -843,32 +864,21 @@ void Settings_ModalOptions( thread_Settings *mExtSettings ) {
     if (!isBWSet(mExtSettings) && isUDP(mExtSettings)) {
 	mExtSettings->mUDPRate = kDefault_UDPRate;
     }
-    // Check options for mutualities
-    if (isTxSync(mExtSettings)) {
-	if (mExtSettings->mThreadMode != kMode_Client) {
-	    fprintf(stderr, "option --tx-sync only supported on clients\n");
-	    exit(1);
+
+    if (mExtSettings->mThreadMode != kMode_Client) {
+	if (isVaryLoad(mExtSettings)) {
+	    fprintf(stderr, "option of variance ignored as not supported on the server\n");
 	}
-	if (isUDP(mExtSettings)) {
-	    if (isBWSet(mExtSettings)) {
-		fprintf(stderr, "option --tx-sync and -b are mutually exclusive\n");
-		exit(1);
-	    }
-	} else {
-	    fprintf(stderr, "option --tx-sync not supported for TCP, only UDP (-u option)\n");
-	    exit(1);
+	if (isTxStartTime(mExtSettings)) {
+	    unsetTxStartTime(mExtSettings);
+	    fprintf(stderr, "option of --txstart-time ignored as not supported on the server\n");
 	}
-	if (isIsochronous(mExtSettings)) {
-	  fprintf(stderr, "option --tx-sync and --isochronous are mutually exclusive\n");
-	  exit(1);
-	}
-    }
-    if ((mExtSettings->mThreadMode != kMode_Client) && isVaryLoad(mExtSettings)) {
-	fprintf(stderr, "option of variance ignored as not supported on the server\n");
     }
 
+
     // UDP histogram settings
-    if (isUDPHistogram(mExtSettings) && isUDP(mExtSettings) && mExtSettings->mThreadMode != kMode_Client) {
+    if (isUDPHistogram(mExtSettings) && isUDP(mExtSettings) && \
+	(mExtSettings->mThreadMode != kMode_Client) && mExtSettings->mUDPHistogramStr) {
 	if (((results = strtok(mExtSettings->mUDPHistogramStr, ",")) != NULL) && !strcmp(results,mExtSettings->mUDPHistogramStr)) {
 	    char *tmp = new char [strlen(results) + 1];
 	    strcpy(tmp, results);
@@ -881,9 +891,9 @@ void Settings_ModalOptions( thread_Settings *mExtSettings ) {
 	    if ((results = strtok(results+strlen(results)+1, ",")) != NULL) {
 		mExtSettings->mUDPbins = byte_atoi(results);
 		if ((results = strtok(NULL, ",")) != NULL) {
-		    mExtSettings->mUDPci_lower = atoi(results);
+		    mExtSettings->mUDPci_lower = atof(results);
 		    if ((results = strtok(NULL, ",")) != NULL) {
-			mExtSettings->mUDPci_upper = atoi(results);
+			mExtSettings->mUDPci_upper = atof(results);
 		    }
 		}
 	    }
@@ -1139,6 +1149,7 @@ int Settings_GenerateClientHdr( thread_Settings *client, client_hdr *hdr ) {
     if (isPeerVerDetect(client) || (client->mMode != kTest_Normal && isBWSet(client))) {
 	flags |= HEADER_EXTEND;
     }
+    flags |= HEADER_SEQNO64B;
     if ( client->mMode != kTest_Normal ) {
 	flags |= HEADER_VERSION1;
 	if ( isBuflenSet( client ) ) {
@@ -1168,7 +1179,7 @@ int Settings_GenerateClientHdr( thread_Settings *client, client_hdr *hdr ) {
 	 */
 	hdr->udp.tlvoffset = htons((sizeof(client_hdr_udp_tests) + sizeof(client_hdr_v1) + sizeof(UDP_datagram)));
 
-	if (isL2LengthCheck(client) || isIsochronous(client) || isUDPTriggers(client)) {
+	if (isL2LengthCheck(client) || isIsochronous(client)) {
 	    flags |= HEADER_UDPTESTS;
 	    uint16_t testflags = 0;
 
@@ -1180,21 +1191,6 @@ int Settings_GenerateClientHdr( thread_Settings *client, client_hdr *hdr ) {
 	    if (isIsochronous(client)) {
 		hdr->udp.tlvoffset = htons((sizeof(UDP_isoch_payload) + sizeof(client_hdr_udp_tests) + sizeof(client_hdr_v1) + sizeof(UDP_datagram)));
 		testflags |= HEADER_UDP_ISOCH;
-	    }
-	    if (isUDPTriggers(client)) {
-		testflags |= HEADER_UDPTRIGGERS;
-		hdr->udp.ref_sync_tv_sec = htonl(0xFFFFFFFF);
-	        hdr->udp.ref_sync_tv_nsec = htonl(0x0);
-#ifdef HAVE_UDPTRIGGERS
-		if (client->mIfrname) {
-		    uint32_t tsfnow = read_80211_tsf(client);
-		    hdr->udp.ref_sync_tv_sec = htonl(tsfnow/1000000);
-		    hdr->udp.ref_sync_tv_nsec = htonl((tsfnow%1000000) * 1000);
-		    Timestamp gpsnow;
-		    hdr->udp.gps_sync_tv_sec = htonl(gpsnow.getSecs());
-		    hdr->udp.gps_sync_tv_nsec = htonl(gpsnow.getUsecs() * 1000);
-		}
-#endif
 	    }
 	    // Write flags to header so the listener can determine the tests requested
 	    hdr->udp.testflags = htons(testflags);
