@@ -24,6 +24,11 @@ RUN mkdir /etc/filebeat && \
   rm -rf filebeat*
 
 WORKDIR /etc/filebeat
+COPY filebeat.yml /etc/filebeat/
+COPY filebeat.reference.yml /etc/filebeat/
+COPY fields.yml /etc/filebeat/
+COPY inject.sh /usr/local/bin
+
 CMD [ "filebeat", "-e"]
 CMD exec /bin/sh -c "trap : TERM INT; (while true; do sleep 1000; done) & wait"
 #ENTRYPOINT ["/bin/iperf"]
