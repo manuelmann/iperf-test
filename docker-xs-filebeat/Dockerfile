@@ -20,7 +20,7 @@ RUN mkdir /etc/filebeat && \
   apk add --no-cache wget && \
   wget -q https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-${FILEBEAT_VERSION}-linux-x86_64.tar.gz --no-check-certificate -O filebeat.tar.gz && \
   tar xzvf filebeat.tar.gz && \
-  cp filebeat-*/filebeat /usr/local/bin && \
+  cp filebeat-*/filebeat /bin/filebeat && \
   rm -rf filebeat*
 
 WORKDIR /etc/filebeat
