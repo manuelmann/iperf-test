@@ -12,4 +12,4 @@ COPY --from=builder /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1
 COPY --from=builder /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
 COPY --from=builder /iperf2-test/src/iperf /bin/iperf
 CMD exec /bin/sh -c "trap : TERM INT; (while true; do sleep 1000; done) & wait"
-#ENTRYPOINT ["/bin/iperf"]
+ENTRYPOINT ["/bin/iperf"]
